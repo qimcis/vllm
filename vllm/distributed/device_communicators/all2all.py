@@ -11,6 +11,10 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_capture,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.distributed.utils import StatelessProcessGroup
@@ -51,6 +55,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        self._eager_break_out_bufs: dict[tuple, torch.Tensor] = {}
 
     def _get_comm_group(self, is_sequence_parallel: bool) -> Any:
         if is_sequence_parallel:
@@ -68,6 +73,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
         assert sizes is not None
         return sizes
+
+    def _copy_to_stable_out(self, role: str, src: torch.Tensor) -> torch.Tensor:
+        # Eager-break ops must return in-place outputs: replay drops the
+        # recorded call's return value, and a fresh collective result may land
+        # at a different address each call, so copy it into persistent
+        # shape-keyed scratch that downstream graph segments reference. Runs
+        # in plain eager calls too: a replay is indistinguishable from one.
+        key = (role, tuple(src.shape), src.dtype, src.device)
+        buf = self._eager_break_out_bufs.get(key)
+        if buf is None:
+            buf = torch.empty_like(src)
+            self._eager_break_out_bufs[key] = buf
+        buf.copy_(src)
+        return buf
 
     def dispatch_router_logits(
         self,
@@ -113,6 +132,32 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(hidden_states.shape[0], dist_group)
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+        # sizes is baked into the eager-break segment instead of re-read from
+        # the forward context there: replays do not re-enter the model forward,
+        # so dp_metadata.local_sizes is gone when the segment re-runs.
+        return self._dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel,
+            sizes,
+            extra_tensors,
+        )
+
+    @eager_break_during_capture
+    def _dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool,
+        sizes: list[int],
+        extra_tensors: list[torch.Tensor] | None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        dist_group = self._get_comm_group(is_sequence_parallel)
 
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
@@ -123,6 +168,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             dim=0,
             sizes=sizes,
         )
+        if is_breakable_cudagraph_enabled():
+            gathered_tensors = [
+                self._copy_to_stable_out(f"dispatch_{i}", t)
+                for i, t in enumerate(gathered_tensors)
+            ]
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
@@ -142,7 +192,19 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        return self._combine(hidden_states, is_sequence_parallel, sizes)
+
+    @eager_break_during_capture
+    def _combine(
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool,
+        sizes: list[int],
+    ) -> torch.Tensor:
+        dist_group = self._get_comm_group(is_sequence_parallel)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        if is_breakable_cudagraph_enabled():
+            hidden_states = self._copy_to_stable_out("combine", hidden_states)
         return hidden_states
 
     def destroy(self):

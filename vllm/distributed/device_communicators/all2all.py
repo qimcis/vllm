@@ -12,7 +12,6 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
-    BreakableCUDAGraphCapture,
     eager_break_during_capture,
     is_breakable_cudagraph_enabled,
 )
@@ -57,6 +56,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
         self._eager_break_out_bufs: dict[tuple, torch.Tensor] = {}
+        # Dedicated stream + external event pair for eager-break collectives
+        # (v4 = the v2 architecture + external events).
+        self._eager_comm_stream: torch.cuda.Stream | None = None
+        self._eager_comm_ready_ev: torch.cuda.Event | None = None
+        self._eager_comm_done_ev: torch.cuda.Event | None = None
 
     def _get_comm_group(self, is_sequence_parallel: bool) -> Any:
         if is_sequence_parallel:
@@ -89,35 +93,123 @@ class AgRsAll2AllManager(All2AllManagerBase):
         buf.copy_(src)
         return buf
 
-    def _eager_gap_epilogue(self) -> None:
-        # Deterministic gap drain: the one primitive PR #46372's discipline
-        # lacks. Every eager (non-captured) NCCL collective leaves NCCL's
-        # per-enqueue strong-stream event work and pending cumem frees bound
-        # to the LAUNCH (= capture) stream (NCCL 2.30 enqueue.cc
-        # ncclLaunchPrepare/Finish: the launch stream waits the strong
-        # stream's scratch event; finishedEvent is recorded on the launch
-        # stream and waited by the strong stream). If the next segment's
-        # capture_begin opens while that event work is still pending, the
-        # strong stream's wait resolves against a capturing stream and
-        # forks it into the capture unjoined ->
-        # cudaErrorStreamCaptureUnjoined (the v1 rig crash). A host sync
-        # here forces those edges to settle first, deterministically.
-        # Legal: this runs in the machinery's own gap (_end_segment closed
-        # the segment; _begin_segment has not reopened it), so no capture
-        # is in progress anywhere.
+    def _eager_comm_state(
+        self,
+    ) -> tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]:
+        # Lazily create the comm stream and its EXTERNAL event pair on the
+        # device of first use (the worker's device at the first dispatch /
+        # combine). Both events are torch.cuda.Event(external=True): while a
+        # capture is active on the recording/waiting stream, torch 2.13 then
+        # issues cudaEventRecordWithFlags(..., cudaEventRecordExternal) /
+        # cudaStreamWaitEvent(..., cudaEventWaitExternal) (c10/cuda/CUDAEvent.h
+        # :130-155 / :168-191) instead of the default calls -- the CUDA-legal
+        # way to express cross-capture event dependencies (v2's plain events
+        # made the same edges illegal captured ops: isolation aborts).
+        if self._eager_comm_stream is None:
+            self._eager_comm_stream = torch.cuda.Stream()
+            self._eager_comm_ready_ev = torch.cuda.Event(external=True)
+            self._eager_comm_done_ev = torch.cuda.Event(external=True)
+        assert self._eager_comm_ready_ev is not None
+        assert self._eager_comm_done_ev is not None
+        return (
+            self._eager_comm_stream,
+            self._eager_comm_ready_ev,
+            self._eager_comm_done_ev,
+        )
+
+    def _run_on_comm_stream(self, fn):
+        """Run one eager NCCL collective on a dedicated comm stream, with
+        EXTERNAL CUDA event join edges on both sides of it.
+
+        Why the side stream: NCCL attaches its internal strong-stream /
+        launch-order cross-stream event work to the stream the collective is
+        enqueued on (NCCL 2.30 src/enqueue.cc ncclLaunchPrepare/Finish:
+        the internal stream waits an event recorded on the launch stream and
+        the launch stream waits an internal-stream event, per enqueue). With
+        the collective on the capture stream, those edges leave NCCL's
+        internal streams fork-joined against the capture stream, and a
+        current_stream().synchronize() cannot drain them (they live on
+        NCCL's internal stream, not the launch stream) -- the next segment's
+        cudaStreamEndCapture aborts with cudaErrorStreamCaptureUnjoined
+        ("the capture sequence contains a fork that was not joined to the
+        primary stream"; the v1 and v3-inline hardware verdicts). Moving the
+        collective here points NCCL's internal edges at this stream, away
+        from the capture stream (the v2 hardware result: the 904 class was
+        gone).
+
+        Why EXTERNAL events (the v4 change; v2 used plain events): in the
+        machinery's own gap (add_eager: _end_segment -> fn() ->
+        _begin_segment) no capture is active, so both edges below are plain
+        eager ops -- but any schedule that runs this body while a capture
+        window is open (e.g. a nested replay inside another descriptor's
+        capture) turns them into captured ops, and a captured wait on a
+        non-captured event is ILLEGAL: "It is invalid to wait on a
+        non-captured event from a stream which is being captured without
+        specifying the cudaEventWaitExternal flag" (CUDA 12.9 Programming
+        Guide 4.2.8.7.3.2) -> cudaErrorStreamCaptureIsolation, capture
+        abort, allocator unwind (the v2 hardware verdict). With
+        torch.cuda.Event(external=True), torch 2.13 routes the same
+        stream.wait_event()/record() through cudaStreamWaitEvent /
+        cudaEventRecordWithFlags WITH the cudaEventWaitExternal /
+        cudaEventRecordExternal flag whenever the current stream is
+        capturing (c10/cuda/CUDAEvent.h:130-155/:168-191), making both
+        edges LEGAL in every schedule: the wait is "captured in the graph
+        as an external event node" (CUDA Runtime API,
+        group__CUDART__EVENT/group__CUDART__STREAM) -- a cross-capture
+        dependency node the capture may legally end with pending, and the
+        record stays an external node that other streams may wait without
+        entering the capture (CUDA 12.9 Programming Guide, "Ordering
+        established by using graph external event nodes"). Outside capture
+        the external flag is inert (torch passes the default flags), so
+        capture-time gaps and replays behave exactly like v2.
+
+        Both edges are events, never host syncs (the eager-break gap must
+        not block, and mid-capture synchronization is illegal):
+
+        - ready: recorded on the caller's (capture/replay) stream after the
+          producing ops and waited by the comm stream before the collective
+          consumes its inputs. v1 got this ordering implicitly by running
+          producer and collective on one stream in order; with a side stream
+          it must be explicit, so it is. In the gap the record is eager; if
+          a foreign capture window is open instead, the record lands as an
+          external event node in that graph and the comm stream's plain
+          wait stays out of the capture (a plain event would pull the comm
+          stream INTO the capture: "When a captured event is waited on by a
+          stream, it places the stream in capture mode" -- CUDA 12.9
+          Programming Guide 4.2.8.7.3.1 -- leaving an unjoined fork).
+
+        - done: recorded on the comm stream after the collective (and the
+          stable scratch copy) and waited by the caller's stream before the
+          next segment is captured, so no un-joined comm-side work
+          straddles a capture boundary at capture time. At replay the
+          recorded fn re-runs and re-arms both edges, so the following
+          graph launch stays ordered behind the collective then too; if the
+          wait ever lands inside an open window it becomes the external
+          event wait node above instead of an isolation abort.
+
+        Scope gates: a no-op when breakable cudagraph is disabled, and
+        when the current stream is itself capturing (FULL-mode whole-graph
+        capture keeps the pre-patch behavior: NCCL captured into the graph
+        on the current stream, which NCCL supports).
+        """
         if not is_breakable_cudagraph_enabled():
-            return
-        capture = BreakableCUDAGraphCapture.current()
-        if capture is None:
-            # Replays and plain eager calls re-run this body outside any
-            # capture context: no drain, zero steady-state cost.
-            return
-        if capture._capturing:
-            # A segment capture is open (FULL-mode unbroken in-graph run):
-            # synchronizing a capturing stream is illegal, and NCCL's own
-            # captured path joins its streams into the graph.
-            return
-        torch.cuda.current_stream().synchronize()
+            return fn()
+        if torch.cuda.is_current_stream_capturing():
+            # FULL whole-graph capture: the collective is captured into the
+            # graph on the current stream (torch's supported NCCL path, same
+            # as before this patch). The side-stream discipline is for the
+            # breakable-cudagraph eager gaps only, where no capture is
+            # active on the current stream.
+            return fn()
+        cur = torch.cuda.current_stream()
+        comm, ready_ev, done_ev = self._eager_comm_state()
+        ready_ev.record(cur)
+        comm.wait_event(ready_ev)
+        with torch.cuda.stream(comm):
+            result = fn()
+        done_ev.record(comm)
+        cur.wait_event(done_ev)
+        return result
 
     def dispatch_router_logits(
         self,
@@ -133,30 +225,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(hidden_states.shape[0], dist_group)
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
-        # sizes is baked into the eager-break segment instead of re-read from
-        # the forward context there: replays do not re-enter the model forward,
-        # so dp_metadata.local_sizes is gone when the segment re-runs.
-        return self._dispatch_router_logits(
-            hidden_states,
-            router_logits,
-            is_sequence_parallel,
-            sizes,
-            extra_tensors,
-        )
-
-    @eager_break_during_capture
-    def _dispatch_router_logits(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        is_sequence_parallel: bool,
-        sizes: list[int],
-        extra_tensors: list[torch.Tensor] | None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
-    ):
-        dist_group = self._get_comm_group(is_sequence_parallel)
 
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
@@ -167,12 +235,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
             dim=0,
             sizes=sizes,
         )
-        if is_breakable_cudagraph_enabled():
-            gathered_tensors = [
-                self._copy_to_stable_out(f"router_logits_{i}", t)
-                for i, t in enumerate(gathered_tensors)
-            ]
-            self._eager_gap_epilogue()
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -224,17 +286,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
-        if is_breakable_cudagraph_enabled():
-            gathered_tensors = [
-                self._copy_to_stable_out(f"dispatch_{i}", t)
-                for i, t in enumerate(gathered_tensors)
-            ]
-            self._eager_gap_epilogue()
+        def _collective():
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
+            if is_breakable_cudagraph_enabled():
+                gathered_tensors = [
+                    self._copy_to_stable_out(f"dispatch_{i}", t)
+                    for i, t in enumerate(gathered_tensors)
+                ]
+            return gathered_tensors
+
+        gathered_tensors = self._run_on_comm_stream(_collective)
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
@@ -264,11 +329,14 @@ class AgRsAll2AllManager(All2AllManagerBase):
         sizes: list[int],
     ) -> torch.Tensor:
         dist_group = self._get_comm_group(is_sequence_parallel)
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-        if is_breakable_cudagraph_enabled():
-            hidden_states = self._copy_to_stable_out("combine", hidden_states)
-            self._eager_gap_epilogue()
-        return hidden_states
+
+        def _collective():
+            rs = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+            if is_breakable_cudagraph_enabled():
+                rs = self._copy_to_stable_out("combine", rs)
+            return rs
+
+        return self._run_on_comm_stream(_collective)
 
     def destroy(self):
         pass

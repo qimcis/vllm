@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -48,6 +49,12 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
+
+# Boot-probe breadcrumbs (inert unless VLLM_BCG_PROBE_LOG=1): gap open/close,
+# post-begin sticky cuda errors, and the PRIMARY capture_end failure before
+# it is re-raised, so a capture abort names its class on the first rig try
+# instead of surfacing only the downstream allocator assert.
+PROBE = bool(os.environ.get("VLLM_BCG_PROBE_LOG", "0") == "1")
 
 
 def is_breakable_cudagraph_enabled() -> bool:
@@ -156,6 +163,9 @@ class BreakableCUDAGraphCapture:
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing: bool = False
+        # Probe/latch state: the primary error from a failed capture_end.
+        self._probe_primary: BaseException | None = None
+        self._probe_end_attempted: bool = False
 
     # --- context manager protocol ----------------------------------------
 
@@ -167,6 +177,12 @@ class BreakableCUDAGraphCapture:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if PROBE and exc is not None:
+            logger.error(
+                "BCG-PROBE __exit__ with in-flight exception %r; "
+                "_end_segment retry follows",
+                exc,
+            )
         try:
             self._end_segment()
         finally:
@@ -181,6 +197,13 @@ class BreakableCUDAGraphCapture:
             g.capture_begin(pool=self.pool)
         else:
             g.capture_begin()
+        if PROBE:
+            logger.warning(
+                "BCG-PROBE segment begin graph=%s seg=%d lasterr=%s",
+                id(g),
+                self._num_graphs,
+                torch.cuda.cudart().cudaGetLastError(),
+            )
         self._current_graph = g
         self._capturing = True
 
@@ -188,7 +211,49 @@ class BreakableCUDAGraphCapture:
         if not self._capturing:
             return
         assert self._current_graph is not None
-        self._current_graph.capture_end()
+        if PROBE:
+            if self._probe_primary is not None:
+                # only reachable in a latch-less (pure-observational) build:
+                # with the latch below, the failed capture cleared the segment
+                # state, so __exit__'s _end_segment early-returns and the
+                # capture_end never re-runs
+                logger.error(
+                    "BCG-PROBE: _end_segment RETRY on graph=%s; the "
+                    "markCaptureEnd assert is SECONDARY; primary=%r",
+                    id(self._current_graph),
+                    self._probe_primary,
+                )
+            self._probe_end_attempted = True
+        try:
+            self._current_graph.capture_end()
+        except BaseException as e:  # noqa: BLE001
+            if PROBE:
+                logger.error(
+                    "BCG-PROBE PRIMARY capture_end failure: graph=%s seg=%d "
+                    "graphs=%d eager_breaks=%d cur_stream=%s capturing=%s "
+                    "cudaGetLastError=%s exc=%r",
+                    id(self._current_graph),
+                    self._num_graphs,
+                    self._num_graphs,
+                    self._num_eager_breaks,
+                    torch.cuda.current_stream(),
+                    torch.cuda.is_current_stream_capturing(),
+                    torch.cuda.cudart().cudaGetLastError(),
+                    e,
+                )
+                self._probe_primary = e
+            # Failure latch: torch 2.13's CUDAGraph::capture_end saves the
+            # cuda error, decrements the allocator's markCaptureEnd, and
+            # only then raises; this class's unconditional __exit__ would
+            # call capture_end again and turn the primary error into the
+            # CUDACachingAllocator "markCaptureEnd called with no captures
+            # in progress" assert (:3211). Clearing the segment state
+            # before re-raising makes the retry a no-op, so the primary
+            # error surfaces and the assert class is structurally
+            # impossible.
+            self._capturing = False
+            self._current_graph = None
+            raise
         self.segments.append(self._current_graph.replay)
         self._num_graphs += 1
         self._current_graph = None
@@ -203,10 +268,20 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
+        if PROBE:
+            logger.warning("BCG-PROBE gap open seg=%d", self._num_graphs)
         result = fn()
+        if PROBE:
+            logger.warning(
+                "BCG-PROBE gap fn done seg=%d capturing_now=%s",
+                self._num_graphs,
+                torch.cuda.is_current_stream_capturing(),
+            )
         self.segments.append(fn)
         self._num_eager_breaks += 1
         self._begin_segment()
+        if PROBE:
+            logger.warning("BCG-PROBE gap close seg=%d", self._num_graphs)
         return result
 
     # --- replay ----------------------------------------------------------

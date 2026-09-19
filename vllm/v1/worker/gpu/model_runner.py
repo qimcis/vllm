@@ -1735,6 +1735,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            if (
+                dp_sync is not None
+                and dp_sync.uniform_token_count == self.decode_query_len
+                and batch_desc.num_tokens % dp_sync.uniform_token_count == 0
+            ):
+                # Keep the DP-padded dummy a uniform decode of decode_query_len
+                # tokens per request, matching the sync the speculator will
+                # reuse (FULL mode already gets this via desc.num_reqs;
+                # PIECEWISE has num_reqs=None).
+                dummy_num_reqs = batch_desc.num_tokens // dp_sync.uniform_token_count
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
                 batch_desc.num_tokens,

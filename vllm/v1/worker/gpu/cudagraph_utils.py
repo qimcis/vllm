@@ -24,6 +24,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
+    _apply_to_device_comms,
     get_pp_group,
     graph_capture,
     is_global_first_rank,
@@ -844,6 +845,34 @@ _FULL_GRAPH_PROFILING_SAMPLES = 2
 _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
+def _drain_pynccl_comms() -> None:
+    """Consume NCCL state left by collectives captured into graphs, before
+    the profiling graphs and their pool are destroyed unreplayed.
+
+    NCCL keeps per-capture channel/work state on the communicator after a
+    graph capture ends; destroying the graphs without replaying leaves that
+    state pointing at pool memory that ``empty_cache`` is about to release,
+    and the next eager collective on the comm consumes it against freed
+    buffers (driver 226, an invalid peer GPU memory access). One eager
+    collective per PYNCCL group, run while the pool is still alive, moves
+    that consumption to a point where the state is backed by valid memory
+    (mirrors the one-element warm-up ``all_reduce`` of comm init). The
+    device syncs order the drain after the capture and complete it, plus
+    NCCL's internal strong-stream tail, before the graphs are destroyed.
+    """
+    torch.accelerator.synchronize()
+
+    def drain(device_communicator: Any) -> None:
+        comm = getattr(device_communicator, "pynccl_comm", None)
+        if comm is None or comm.disabled or not comm.available:
+            return
+        buffer = torch.zeros(1, dtype=torch.float32, device=comm.device)
+        comm.all_reduce(buffer)
+
+    _apply_to_device_comms(drain)
+    torch.accelerator.synchronize()
+
+
 @torch.inference_mode()
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
@@ -895,6 +924,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         original_pools: dict[int, Any] = {}
         speculator = getattr(runner, "speculator", None)
         spec_manager_names: list[str] = []
+        profiled = False
         try:
             if not manager.needs_capture():
                 return 0
@@ -920,6 +950,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             manager._capture_mem_samples = mem_samples
 
             measured = int(runner.capture_model(profile_only=True))
+            profiled = True
 
             # The measured delta covers PIECEWISE, encoder and speculator graphs
             # plus the sampled FULL graphs; swap the sampled FULL cost for the
@@ -932,6 +963,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
             compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
+            if profiled:
+                _drain_pynccl_comms()
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
             for wrapper in all_wrappers:

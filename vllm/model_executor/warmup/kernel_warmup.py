@@ -337,6 +337,12 @@ def _flashinfer_autotune_token_counts(
     max_tokens = runner.scheduler_config.max_num_batched_tokens
     # Tune the widest bucket set first so bounded passes reuse its configs.
     token_counts = [max_tokens]
+    # Mid shapes too: runtime batches below max_num_batched_tokens fall back
+    # to heuristic kernels without their own tuning passes.
+    for divisor in (2, 8):
+        mid = max_tokens // divisor
+        if mid >= 64:
+            token_counts.append(mid)
     linear_backend = runner.vllm_config.kernel_config.linear_backend
     if (
         include_bf16

@@ -2289,6 +2289,11 @@ class HiSparseSourceManager(FullAttentionManager):
                 assert self.coordinator is not None
                 assert self.coordinator.gpu_pool is not None
                 return self.coordinator.gpu_pool.num_gpu_blocks + 1
+        if self.coordinator is not None and request_id not in self.num_cached_block:
+            num_host_pages = cdiv(num_local_computed_tokens, self.block_size)
+            return self.coordinator.get_num_copy_blocks_to_pin(
+                new_computed_blocks[:num_host_pages]
+            )
         return 0
 
     def allocate_new_blocks(
@@ -2580,6 +2585,8 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         replay_boundaries: Sequence[int],
     ) -> None:
         assert self.coordinator is not None
+        if self is not self.coordinator.resident_managers[0]:
+            return
         self.coordinator.plan_prefix_materialization(request.request_id, num_tokens)
         self.coordinator.update_residency(request.request_id)
 

@@ -391,6 +391,7 @@ class RustFrontendProcessManager:
                 "data_parallel_hybrid_lb",
             },
         )
+        args_dict["model_tag"] = args.model
         # The Rust `frontend` subcommand parses --args-json via serde_json,
         # which bypasses clap and therefore ignores any `#[arg(env = ...)]`
         # declarations on SharedRuntimeArgs fields. Forward the env-driven

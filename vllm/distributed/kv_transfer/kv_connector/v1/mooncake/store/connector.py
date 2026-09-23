@@ -13,6 +13,7 @@ enabling prefix caching via hash-based deduplication.
 
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -43,7 +44,11 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    HiSparseResidentSpec,
+    KVCacheConfig,
+    KVCacheGroupRole,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -53,6 +58,22 @@ from .scheduler import MooncakeStoreScheduler
 from .worker import MooncakeStoreWorker
 
 logger = init_logger(__name__)
+
+
+def _mooncake_cache_config(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
+    """Keep HiSparse's durable host source in the Mooncake store projection."""
+    if kv_cache_config.hisparse_host_num_blocks is None:
+        return kv_cache_config
+
+    groups = []
+    for group in kv_cache_config.kv_cache_groups:
+        if group.role is KVCacheGroupRole.HISPARSE_SOURCE:
+            groups.append(replace(group, enable_kv_transfer=True))
+        elif isinstance(group.kv_cache_spec, HiSparseResidentSpec):
+            groups.append(replace(group, enable_kv_transfer=False))
+        else:
+            groups.append(group)
+    return replace(kv_cache_config, kv_cache_groups=groups)
 
 
 class MooncakeStoreKVEvents(KVConnectorKVEvents):
@@ -161,6 +182,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
     ):
+        if kv_cache_config is not None:
+            kv_cache_config = _mooncake_cache_config(kv_cache_config)
         super().__init__(
             vllm_config=vllm_config,
             role=role,

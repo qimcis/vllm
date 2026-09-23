@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheGroupRole
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -62,6 +63,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             actual = self._get_remote_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
             if count > 0:
+                if self.hisparse is not None:
+                    self.hisparse.prepare_gpu_import(request.request_id)
                 return count, True
 
         if (
@@ -100,6 +103,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         self.kv_recompute_threshold,
                     )
                     return 0, False
+                if self.hisparse is not None:
+                    self.hisparse.prepare_gpu_import(request.request_id)
                 return count, True
 
         # No remote prefill for this request.
@@ -151,6 +156,22 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         if num_external_tokens > 0
                         else ()
                     )
+                    if self.hisparse is not None and self.hisparse.imports_to_host(
+                        request.request_id
+                    ):
+                        source_group_ids = [
+                            group_id
+                            for group_id, group in enumerate(
+                                self.kv_cache_config.kv_cache_groups
+                            )
+                            if group.role is KVCacheGroupRole.HISPARSE_SOURCE
+                        ]
+                        assert len(source_group_ids) == 1
+                        self._hisparse_host_blocks_to_recv[request.request_id] = (
+                            list(unhashed_local_block_ids[source_group_ids[0]])
+                            if unhashed_local_block_ids
+                            else []
+                        )
                     local_block_ids = self.get_exchange_clipped_blocks(
                         unhashed_local_block_ids
                     )

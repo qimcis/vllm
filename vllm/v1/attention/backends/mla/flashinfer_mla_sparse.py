@@ -661,6 +661,14 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._prepare_mqa_kernel(layer, q.device)
 
         if self.use_nvfp4_gather:
+            index_group = self.index_group
+            if isinstance(index_group, HiSparseMLAIndexGroup):
+                return (
+                    self._forward_mqa_nvfp4_hisparse(
+                        q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                    ),
+                    None,
+                )
             return (
                 self._forward_mqa_nvfp4(
                     q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
@@ -814,6 +822,194 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             )
         return out
 
+    def _forward_mqa_nvfp4_hisparse(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Attend over an nvfp4_ds_mla cache through HiSparse + FP8 staging.
+
+        The HiSparse index group resolves each logical top-k row to a
+        physical hot-slab row (host-cold pages are staged by the swap-in);
+        the NVFP4 gather then dequantizes those rows into FP8 staging rows
+        for the FlashInfer kernel, exactly like the non-HiSparse decode
+        fast path. Prefill contexts are staged GPU-side by the index group
+        before the chunked context gather.
+        """
+        if q.dtype != current_platform.fp8_dtype():
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE runs the nvfp4_ds_mla kv-cache dtype with "
+                f"an fp8 query (quantized by the MLA layer), got {q.dtype}"
+            )
+        index_group = self.index_group
+        assert isinstance(index_group, HiSparseMLAIndexGroup)
+        num_actual_toks = q.shape[0]
+        num_decode_tokens = min(attn_metadata.num_decode_tokens, num_actual_toks)
+        out = torch.empty(
+            (num_actual_toks, q.shape[1], self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        if num_decode_tokens > 0:
+            physical_topk, valid_counts = (
+                index_group.convert_decode_logical_to_physical_topk(
+                    self.index_group_index,
+                    topk_indices[:num_decode_tokens],
+                    attn_metadata,
+                    return_valid_counts=True,
+                )
+            )
+            hot = index_group.physical_kv_cache(self.index_group_index)
+            self._nvfp4_decode_from_rows(
+                q[:num_decode_tokens],
+                hot,
+                physical_topk,
+                valid_counts,
+                out[:num_decode_tokens],
+            )
+            if num_decode_tokens == num_actual_toks:
+                return out
+        cache = index_group.cache(self.index_group_index)
+        if num_decode_tokens == 0 and cache.all_context_pages_resident:
+            # Pure prefill over fully resident pages: the physical rows are
+            # resident-slab rows, and the hot and resident layouts are
+            # identical, so the same slab read applies.
+            physical_topk, valid_counts = index_group.convert_logical_to_physical_topk(
+                self.index_group_index,
+                topk_indices,
+                attn_metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+            return self._nvfp4_decode_from_rows(
+                q,
+                index_group.physical_kv_cache(self.index_group_index),
+                physical_topk,
+                valid_counts,
+                out,
+            )
+        staged_cache, staging_bt, _req_ids = index_group.stage_prefill_rows(
+            self.index_group_index, kv_cache, attn_metadata
+        )
+        self._nvfp4_prefill_from_staged(
+            q[num_decode_tokens:],
+            staged_cache,
+            staging_bt,
+            topk_indices[num_decode_tokens:],
+            attn_metadata,
+            out[num_decode_tokens:],
+            token_offset=num_decode_tokens,
+        )
+        return out
+
+    def _nvfp4_decode_from_rows(
+        self,
+        q: torch.Tensor,
+        hot: torch.Tensor,
+        physical_topk: torch.Tensor,
+        valid_counts: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Gather swapped-in hot rows to FP8 staging and run the kernel."""
+        assert self._nvfp4_inv_k_scale is not None
+        assert self._nvfp4_decode_rows is not None and (
+            self._nvfp4_decode_indices is not None
+        ), (
+            "nvfp4_ds_mla HiSparse staging needs the FP8 decode staging "
+            "buffers; the FlashInfer native NVFP4 decode kernel has not "
+            "been validated against the HiSparse hot slab. Disable the "
+            "native decode kernel or extend it to read hot rows."
+        )
+        # The gather kernel addresses rows as flat 352 B records; a strided
+        # hot view (non layer-compact layout) would be misread.
+        assert hot.is_contiguous(), (
+            "nvfp4_ds_mla HiSparse staging requires a layer-compact hot "
+            f"layout, got strides {hot.stride()}"
+        )
+        topk = physical_topk.shape[1]
+        step = self._nvfp4_max_decode_tokens
+        for start in range(0, q.shape[0], step):
+            end = min(q.shape[0], start + step)
+            rows = self._nvfp4_decode_rows[: (end - start) * topk]
+            staging_indices = self._nvfp4_decode_indices[: end - start]
+            gather_nvfp4_ds_mla_topk_to_fp8(
+                hot,
+                physical_topk[start:end],
+                rows,
+                staging_indices,
+                self._nvfp4_inv_k_scale,
+            )
+            self._run_mqa_kernel(
+                q[start:end],
+                rows.view(-1, FP8_STAGING_PAGE_SIZE, FP8_STAGING_ROW_DIM),
+                staging_indices,
+                valid_counts[start:end],
+                output=out[start:end],
+            )
+
+    def _nvfp4_prefill_from_staged(
+        self,
+        q: torch.Tensor,
+        staged: torch.Tensor,
+        staging_bt: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        out: torch.Tensor,
+        token_offset: int,
+    ) -> None:
+        """Dequantize staged prefill contexts into the FP8 workspace."""
+        assert self._nvfp4_inv_k_scale is not None
+        plan = attn_metadata.nvfp4_prefill
+        if plan is None:
+            raise RuntimeError(
+                "Prefill tokens reached the nvfp4_ds_mla sparse MQA path "
+                "without a context-gather plan"
+            )
+        num_tokens = q.shape[0]
+        assert plan.request_ids.shape[0] == num_tokens, (
+            plan.request_ids.shape,
+            num_tokens,
+        )
+        # Top-k positions map to workspace rows; the block table is masked
+        # off for prefill rows by the HAS_PREFILL_WORKSPACE kernel.
+        staging_indices, valid_counts = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[token_offset : token_offset + num_tokens],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            HAS_PREFILL_WORKSPACE=True,
+            prefill_workspace_request_ids=plan.request_ids,
+            prefill_workspace_starts=plan.workspace_starts,
+            return_valid_counts=True,
+        )
+        workspace = self._nvfp4_prefill_rows
+        workspace_pages = workspace.view(-1, FP8_STAGING_PAGE_SIZE, FP8_STAGING_ROW_DIM)
+        req_cursor = 0
+        for chunk in plan.chunks:
+            n_reqs = chunk.block_table.shape[0]
+            chunk_bt = staging_bt[req_cursor : req_cursor + n_reqs]
+            req_cursor += n_reqs
+            gather_nvfp4_ds_mla_context_to_fp8(
+                staged,
+                chunk_bt,
+                chunk.workspace_starts,
+                chunk.num_rows,
+                chunk.search_steps,
+                workspace,
+                self._nvfp4_inv_k_scale,
+            )
+            tokens = chunk.tokens_slice
+            self._run_mqa_kernel(
+                q[tokens],
+                workspace_pages,
+                staging_indices[tokens],
+                valid_counts[tokens],
+                output=out[tokens],
+            )
+
     def _nvfp4_decode(
         self,
         q: torch.Tensor,
@@ -961,6 +1157,48 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else kv_cache.dtype
         )
+        if self.use_nvfp4_gather:
+            # The hot slab holds 352 B uint8 nvfp4 records the FP8 kernel
+            # cannot read. Route the autotune batch through the staged
+            # decode fast path so the kernel runs on the FP8 staging rows,
+            # exactly like production. Decode launches are chunked to
+            # _nvfp4_max_decode_tokens, so that is the largest batch the
+            # kernel ever sees.
+            assert self._nvfp4_inv_k_scale is not None
+            num_tokens = min(runtime.max_num_reqs, self._nvfp4_max_decode_tokens)
+            q = torch.zeros(
+                (
+                    num_tokens,
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=q_dtype,
+                device=kv_cache.device,
+            )
+            # The pool is cold at autotune time; cyclic source rows keep the
+            # gather in bounds (values are garbage, fine for tuning).
+            hot_rows = kv_cache.shape[0] * kv_cache.shape[1]
+            physical_topk = (
+                torch.arange(
+                    num_tokens * topk_tokens,
+                    dtype=torch.int32,
+                    device=kv_cache.device,
+                )
+                % hot_rows
+            ).view(num_tokens, topk_tokens)
+            valid_counts = torch.full(
+                (num_tokens,),
+                topk_tokens,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            out = torch.empty(
+                (num_tokens, self.num_heads, self.kv_lora_rank),
+                dtype=torch.bfloat16,
+                device=kv_cache.device,
+            )
+            self._nvfp4_decode_from_rows(q, kv_cache, physical_topk, valid_counts, out)
+            return
         q = torch.zeros(
             (
                 num_tokens,

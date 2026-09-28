@@ -109,11 +109,6 @@ def nvfp4_fp8_gather_unsupported_reason(vllm_config: "VllmConfig") -> str | None
             "FLASHINFER_MLA_SPARSE does not support the nvfp4_ds_mla kv-cache "
             "dtype with context parallelism"
         )
-    if vllm_config.attention_config.hisparse_config is not None:
-        return (
-            "FLASHINFER_MLA_SPARSE does not support the nvfp4_ds_mla kv-cache "
-            "dtype with HiSparse"
-        )
     model_config = vllm_config.model_config
     if model_config is not None:
         hf_text_config = model_config.hf_text_config

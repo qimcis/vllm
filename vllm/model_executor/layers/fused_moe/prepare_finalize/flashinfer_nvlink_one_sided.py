@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+
+logger = init_logger(__name__)
 
 
 def get_local_sizes() -> list[int] | None:
@@ -55,6 +61,12 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             x_bytes_per_token=x_bytes_per_token,
             x_sf_bytes_per_token=x_sf_bytes_per_token,
         )
+        # Lazily resolved: whether the installed FlashInfer MoeAlltoAll.dispatch
+        # class method accepts enable_pdl. Stock 0.7.0 does not expose it and
+        # auto-detects PDL on SM9x/SM10x inside moe_a2a_dispatch; a
+        # class-method-forwarding build (the lane's flashinfer-side patch)
+        # lets vLLM control the dispatch-boundary PDL launch explicitly.
+        self._dispatch_pdl_supported: bool | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -117,13 +129,36 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
-        recv_payloads = self.all2all_manager.moe_alltoall.dispatch(  # type: ignore[attr-defined]
+        moe_alltoall = self.all2all_manager.moe_alltoall
+        assert moe_alltoall is not None
+        # PDL at the dispatch boundary: FlashInfer 0.7.0 silently launches the
+        # dispatch with PDL on SM9x/SM10x (auto-detect), overlapping it into
+        # the preceding attention kernel's tail. That is only safe when the
+        # predecessor attention kernel is PDL-safe (TRTLLM_RAGGED prefill is;
+        # the FlashMLA-family sparse-MLA decode kernel corrupted the dispatch
+        # on B300), so the env-gated default is off.
+        dispatch_kwargs: dict = {}
+        if self._dispatch_pdl_supported is None:
+            self._dispatch_pdl_supported = (
+                "enable_pdl"
+                in inspect.signature(type(moe_alltoall).dispatch).parameters
+            )
+            if not self._dispatch_pdl_supported:
+                logger.warning_once(
+                    "FlashInfer MoeAlltoAll.dispatch does not accept "
+                    "enable_pdl; VLLM_DISPATCH_ENABLE_PDL cannot control the "
+                    "dispatch-boundary PDL launch (FlashInfer auto-detects "
+                    "PDL on SM9x/SM10x)."
+                )
+        if self._dispatch_pdl_supported:
+            dispatch_kwargs["enable_pdl"] = envs.VLLM_DISPATCH_ENABLE_PDL
+        recv_payloads = moe_alltoall.dispatch(
             token_selected_experts=topk_ids,
             input_payloads=payloads,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
+            **dispatch_kwargs,
         )
         if dispatch_x_sf is not None:
             recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads

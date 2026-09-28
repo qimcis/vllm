@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_DISPATCH_ENABLE_PDL: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
@@ -1624,6 +1625,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Launch the FlashInfer one-sided MoE a2a dispatch with programmatic
+    # dependent launch (PDL). FlashInfer 0.7.0 auto-detects PDL on SM9x/SM10x
+    # (True on B300) when vLLM does not pass enable_pdl explicitly, which
+    # overlaps the dispatch into the preceding attention kernel's tail. That
+    # predecessor is only PDL-safe on some attention paths (TRTLLM_RAGGED
+    # prefill is; the FlashMLA-family sparse-MLA decode kernel was observed
+    # corrupting the MoE dispatch on B300), so default to False (serialized
+    # dispatch launch) and let P/D prefill pods opt in per lane.
+    "VLLM_DISPATCH_ENABLE_PDL": lambda: bool(
+        int(os.getenv("VLLM_DISPATCH_ENABLE_PDL", "0"))
+    ),
     # Kimi-K3 only. Under sequence-parallel MoE the dense and shared-expert MLPs
     # are replicated on every rank, so each rank streams the whole weight to
     # serve its own token shard. Shard them across TP instead: the MLP then

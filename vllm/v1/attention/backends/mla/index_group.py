@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.hisparse.runtime import (
     FP8_DS_MLA_ROW_BYTES,
+    NVFP4_DS_MLA_ROW_BYTES,
     HiSparseCacheHandle,
     HiSparsePrefillStagingPlan,
     create_hisparse_cache_handle,
@@ -189,6 +190,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             self.prefill_stream = _create_side_stream(self.logical_topk_indices.device)
         if kv_cache_dtype == "fp8_ds_mla":
             row_width = FP8_DS_MLA_ROW_BYTES
+            kv_dtype = torch.uint8
+        elif kv_cache_dtype == "nvfp4_ds_mla":
+            # 256B e2m1 NoPE + 64B e4m3 RoPE + 32B e4m3 scales.
+            row_width = NVFP4_DS_MLA_ROW_BYTES
             kv_dtype = torch.uint8
         else:
             from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype

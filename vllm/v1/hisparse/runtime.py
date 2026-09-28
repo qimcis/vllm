@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 # fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
 FP8_DS_MLA_ROW_BYTES = 656
+# nvfp4_ds_mla KV row: 256 B e2m1 NoPE + 64 B e4m3 RoPE + 32 B e4m3 scales.
+NVFP4_DS_MLA_ROW_BYTES = 352
 HiSparseTopKResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 

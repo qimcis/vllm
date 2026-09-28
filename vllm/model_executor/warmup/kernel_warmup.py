@@ -5,6 +5,8 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import gc
+import os
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -331,6 +333,87 @@ def _flashinfer_deferred_moe_token_counts(
     return tuple(dict.fromkeys(token_counts))
 
 
+def _moe_dp_padded_max_tokens(runner: "GPUModelRunner") -> int:
+    """Largest MoE input row count one rank can see at runtime, DP-padded.
+
+    With expert parallel over data-parallel ranks, the all-to-all
+    prepare/finalize backends (e.g. FlashInfer NVLink one-sided) DP-align
+    every MoE dispatch to the largest scheduled chunk across the DP ranks
+    and materialize an ``[ep_size * runtime_max_tokens_per_rank, hidden]``
+    recv buffer, so a per-rank chunk of C tokens reaches the MoE kernels as
+    ``dp_size * C`` input rows. ``fi_moe_largest_bucket()`` is the matching
+    upper bound and is exactly what the MoE experts pass to FlashInfer as
+    ``tune_max_num_tokens``; runtime MoE shapes above
+    ``max_num_batched_tokens`` stay inside its bucket range.
+    """
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+
+    return max(
+        (
+            fi_moe_largest_bucket(module.moe_config)
+            for module in runner.get_model().modules()
+            if isinstance(module, MoERunner)
+        ),
+        default=0,
+    )
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True for device-OOM exceptions across every surface they escape.
+
+    The tvm-ffi env-tensor allocator maps torch allocator failures to a
+    plain Python ``MemoryError`` (TorchDLPackExchangeAPI SetError), so an
+    FP4 MoE ``prepare_moe`` workspace OOM does NOT surface as
+    ``torch.cuda.OutOfMemoryError``; some paths raise a RuntimeError with
+    a "CUDA out of memory" message instead.
+    """
+    return isinstance(exc, (torch.cuda.OutOfMemoryError, MemoryError)) or (
+        isinstance(exc, RuntimeError) and "cuda out of memory" in str(exc).lower()
+    )
+
+
+def _clear_cuda_cache_if_safe() -> None:
+    # torch.cuda.empty_cache() is illegal during CUDA-graph capture.
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.empty_cache()
+
+
+def _skip_autotune_oom(message: str, exc: BaseException) -> None:
+    """Log (and swallow) a warmup-path OOM, or re-raise when unsafe.
+
+    Never-crash-the-boot net for the FlashInfer autotune window (mega-batch
+    v3): the DP-padded bucket dummy runs invoke MoE workspaces that cannot
+    fit the BOOT headroom (the autotune window holds a large transient
+    residue), even though the same tactic fits at serving time (the KV
+    sizing reserves the transient peak headroom). A skip is perf-only: the
+    bucket keeps whatever winner the probe/profiling chose, or the default
+    tactic.
+
+    Swallowing is only safe without a distributed tune group: a rank-local
+    skip would desynchronize the per-tactic all-reduce lockstep of
+    synchronized autotuning and deadlock peers. With world_size > 1 the
+    OOM is re-raised (fatal, but collectively consistent).
+    """
+    from vllm.distributed.parallel_state import get_world_group
+
+    logger.error("%s (%s: %s)", message, type(exc).__name__, exc, exc_info=True)
+    _clear_cuda_cache_if_safe()
+    if get_world_group().world_size > 1:
+        raise exc
+    try:
+        free_b, _total = torch.cuda.mem_get_info()
+    except Exception:
+        free_b = 0
+    logger.warning(
+        "%s; driver free %.2f GiB after cache clear; continuing boot. "
+        "This is a warmup-headroom skip, NOT a serving-capacity verdict "
+        "(the autotune window itself holds a large transient residue).",
+        message,
+        free_b / (1024**3),
+    )
+
+
 def _flashinfer_autotune_token_counts(
     runner: "GPUModelRunner", *, include_bf16: bool = True
 ) -> tuple[int, ...]:
@@ -354,21 +437,98 @@ def _run_flashinfer_autotune_dummy_runs(
     import vllm.utils.flashinfer as fi_utils
 
     dummy_run_kwargs = {"skip_attn": True} if skip_attn else {}
-    for num_tokens in _flashinfer_autotune_token_counts(runner, include_bf16=False):
-        tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(num_tokens)
-        logger.info(
-            "Running FlashInfer autotune with %d tokens and token buckets %s.",
-            num_tokens,
-            tuning_buckets,
-        )
-        with fi_utils.autotune(tuning_buckets=tuning_buckets):
-            runner._dummy_run(
-                num_tokens=num_tokens,
-                skip_eplb=True,
-                is_profile=True,
-                randomize_inputs=True,
-                **dummy_run_kwargs,
+
+    # Tune buckets up to the DP-padded MoE maximum, not just the per-rank
+    # batch budget. Runtime MoE input rows can be dp_size * chunk (see
+    # _moe_dp_padded_max_tokens); with buckets capped at
+    # max_num_batched_tokens, every chunk larger than
+    # max_num_batched_tokens / dp_size maps (round-up) to an untuned
+    # bucket at runtime and the AutoTuner falls back to tactic=-1,
+    # stalling prefill for seconds per invocation.
+    moe_bucket_max = _moe_dp_padded_max_tokens(runner)
+    token_counts = _flashinfer_autotune_token_counts(runner, include_bf16=False)
+    max_rank_tokens = max(token_counts)
+    # Mega-batch OOM hardening: the DP-padded buckets admit tactics whose
+    # FP4BlockScaleLauncher::prepare_moe workspace is far larger than the
+    # post-KV-pool headroom. A memory-probe-aware FlashInfer autotuner
+    # (opt-in via these env vars) disqualifies tactics whose eager-run peak
+    # allocation exceeds (driver free minus margin) at profiling time.
+    # MIN_SHAPE gates the probe to the DP-padded buckets only: buckets <=
+    # max_num_batched_tokens keep byte-identical tactic selection and
+    # their persisted cache entries from prior boots.
+    probe_overrides = {}
+    if moe_bucket_max > max_rank_tokens:
+        probe_overrides = {
+            "FLASHINFER_AUTOTUNE_MEM_PROBE": "1",
+            "FLASHINFER_AUTOTUNE_MEM_PROBE_MIN_SHAPE": str(max_rank_tokens),
+        }
+    saved_env = {key: os.environ.get(key) for key in probe_overrides}
+    os.environ.update(probe_overrides)
+    try:
+        for num_tokens in token_counts:
+            tune_bucket_max = max(num_tokens, moe_bucket_max)
+            tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
+                tune_bucket_max
             )
+            logger.info(
+                "Running FlashInfer autotune with %d tokens and token buckets %s.",
+                num_tokens,
+                tuning_buckets,
+            )
+            # DP-padded MoE input rows this dummy run exercises: every DP
+            # rank contributes num_tokens to the one-sided all-to-all, so
+            # the MoE sees dp_factor * num_tokens rows (the same factor
+            # fi_moe_largest_bucket applies). Used only for skip logs.
+            dp_factor = (
+                moe_bucket_max // max_rank_tokens
+                if moe_bucket_max
+                and max_rank_tokens
+                and moe_bucket_max > max_rank_tokens
+                else 1
+            )
+            bucket_rows = num_tokens * dp_factor
+            with fi_utils.autotune(tuning_buckets=tuning_buckets):
+                # Never-crash-the-boot: a DP-padded bucket whose tactic
+                # workspaces cannot fit the BOOT headroom (autotune-window
+                # residue) must skip the dummy run, log, and continue --
+                # the boot must complete and the bucket keeps its
+                # probe-selected winner (or the default tactic).
+                try:
+                    runner._dummy_run(
+                        num_tokens=num_tokens,
+                        skip_eplb=True,
+                        is_profile=True,
+                        randomize_inputs=True,
+                        **dummy_run_kwargs,
+                    )
+                except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
+                    _skip_autotune_oom(
+                        f"MoE bucket {bucket_rows} skipped: OOM during "
+                        f"FlashInfer autotune dummy run "
+                        f"(num_tokens={num_tokens})",
+                        exc,
+                    )
+                except RuntimeError as exc:
+                    if not _is_cuda_oom(exc):
+                        raise
+                    _skip_autotune_oom(
+                        f"MoE bucket {bucket_rows} skipped: OOM during "
+                        f"FlashInfer autotune dummy run "
+                        f"(num_tokens={num_tokens})",
+                        exc,
+                    )
+            # Minimize the warmup residue between buckets: each dummy run
+            # starts with a clean allocator pool. Buckets already run
+            # small-first (ascending bucket list) and one at a time (this
+            # loop is sequential); the big DP-padded bucket runs last.
+            gc.collect()
+            _clear_cuda_cache_if_safe()
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run_flashinfer_bf16_autotune_dummy_run(
@@ -462,13 +622,36 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None
             )
+
+            def _oom_safe_warmup(name: str, warmup_fn) -> None:
+                try:
+                    warmup_fn()
+                except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
+                    _skip_autotune_oom(
+                        f"FlashInfer autotune warmup {name} skipped: OOM",
+                        exc,
+                    )
+                except RuntimeError as exc:
+                    if not _is_cuda_oom(exc):
+                        raise
+                    _skip_autotune_oom(
+                        f"FlashInfer autotune warmup {name} skipped: OOM",
+                        exc,
+                    )
+
             if hisparse_enabled:
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
-                autotune_hisparse_flashinfer_attention(runner)
+                _oom_safe_warmup(
+                    "hisparse attention",
+                    lambda: autotune_hisparse_flashinfer_attention(runner),
+                )
             _run_flashinfer_autotune_dummy_runs(runner, skip_attn=hisparse_enabled)
-            replayssm_autotune_warmup(runner)
-            _autotune_kimi_k3_kda_qkvg(runner.get_model())
+            _oom_safe_warmup("replayssm", lambda: replayssm_autotune_warmup(runner))
+            _oom_safe_warmup(
+                "kimi_k3 kda qkvg",
+                lambda: _autotune_kimi_k3_kda_qkvg(runner.get_model()),
+            )
         with torch.inference_mode():
             _run_flashinfer_bf16_autotune_dummy_run(
                 runner, skip_ops=skip_ops, skip_attn=hisparse_enabled

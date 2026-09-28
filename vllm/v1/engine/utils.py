@@ -1351,28 +1351,41 @@ def wait_for_engine_startup(
                     f"dp lb mode"
                 )
 
-        if status == "HELLO" and engine.state == CoreEngineState.NEW:
-            # Send init message with DP config info.
-            init_message = msgspec.msgpack.encode(
-                EngineHandshakeMetadata(
-                    addresses=launch.addresses,
-                    parallel_config={
-                        k: getattr(parallel_config, k)
-                        for k in (
-                            "data_parallel_master_ip",
-                            "data_parallel_master_port",
-                            "_data_parallel_master_port_list",
-                            "data_parallel_size",
-                        )
-                    }
-                    if coordinated_dp
-                    else {},
-                )
+        # Init message with DP config info, built once per recv: it depends
+        # only on launch.addresses/parallel_config (never on engine state),
+        # so a retransmitted HELLO can be answered with the same message.
+        init_message = msgspec.msgpack.encode(
+            EngineHandshakeMetadata(
+                addresses=launch.addresses,
+                parallel_config={
+                    k: getattr(parallel_config, k)
+                    for k in (
+                        "data_parallel_master_ip",
+                        "data_parallel_master_port",
+                        "_data_parallel_master_port_list",
+                        "data_parallel_size",
+                    )
+                }
+                if coordinated_dp
+                else {},
             )
+        )
+
+        if status == "HELLO" and engine.state == CoreEngineState.NEW:
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
             conn_pending[0 if local else 1] -= 1
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
+        elif status == "HELLO" and engine.state == CoreEngineState.CONNECTED:
+            # Idempotent re-HELLO: the peer re-executed its startup handshake
+            # (e.g. a respawned engine process after a long init phase, such
+            # as the FlashInfer autotune end-of-init skew) and HELLOs again
+            # after we already moved it to CONNECTED. Resend the init
+            # message; the pending counters already account for this engine
+            # from its first HELLO, so leave them and the state untouched.
+            # Fail-closed is preserved for every other combination.
+            logger.warning("idempotent re-HELLO ack for engine %d", eng_index)
+            handshake_socket.send_multipart((eng_identity, init_message), copy=False)
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
             # Validate config hash consistency across DP workers for MoE models.
             if coordinated_dp:

@@ -330,9 +330,11 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
-    def forward(
+    def _compute_indexer_inputs(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
+    ):
+        """Per-token indexer inputs up to the op: q (fp8, head-padded),
+        k, weights, gate score."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -406,6 +408,14 @@ class Indexer(nn.Module):
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)
 
+        return q_fp8, k, weights, gate_score
+
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        q_fp8, k, weights, gate_score = self._compute_indexer_inputs(
+            hidden_states, qr, positions, rotary_emb
+        )
         return self.indexer_op(
             hidden_states,
             q_fp8,
@@ -416,6 +426,52 @@ class Indexer(nn.Module):
             index_kpool=self.index_kpool,
             positions=positions,
         )
+
+    def precompute_step0_kv(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Step-0 precompute over the whole padded batch: run only the kpool
+        cache insert (no top-k scoring) and return the per-token q/weights for
+        last-row-only scoring."""
+        q_fp8, k, weights, gate_score = self._compute_indexer_inputs(
+            hidden_states, qr, positions, rotary_emb
+        )
+        self.indexer_op.skip_topk_scoring = True
+        try:
+            self.indexer_op(
+                hidden_states,
+                q_fp8,
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=self.index_kpool_compress_ape,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
+        finally:
+            self.indexer_op.skip_topk_scoring = False
+        return q_fp8, weights
+
+    def score_topk_last_rows(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Top-k scoring only (the kpool insert already ran) on the last rows."""
+        self.indexer_op.skip_k_cache_insert = True
+        try:
+            self.indexer_op(
+                hidden_states,
+                q_fp8,
+                None,
+                weights,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
+        finally:
+            self.indexer_op.skip_k_cache_insert = False
 
 
 class Glm5NextMLAAttention(nn.Module):

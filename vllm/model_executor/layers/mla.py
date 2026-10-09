@@ -253,3 +253,64 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
         return self.o_proj(attn_out)[0]
+
+    def precompute_step0_kv(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple | None]:
+        """Step-0 precompute over the whole padded batch: the q/kv projections,
+        fused q/kv-a RMSNorm, RoPE, the indexer kpool insert, and the KV cache
+        write (the DFlash precompute_and_store_context_kv analog). Attention
+        itself runs later on each request's last valid row only, so its per-row
+        inputs are returned for exact row gathers.
+        """
+        assert self.q_lora_rank is not None and self.fused_qkv_a_proj is not None
+        assert self.fuse_qkv_rmsnorm and not self.dcp_q_replicate
+        assert self.g_proj is None
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        assert self.q_a_layernorm is not None
+        q_proj_input, kv_c_normed = fused_q_kv_rmsnorm(
+            q_c,
+            kv_c,
+            self.q_a_layernorm.weight.data,
+            self.kv_a_layernorm.weight.data,
+            self.q_a_layernorm.variance_epsilon,
+        )
+        k_pe = k_pe.unsqueeze(1)
+        assert self.q_b_proj is not None
+        q = self.q_b_proj(q_proj_input)[0]
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
+        indexer_pre = None
+        if self.indexer is not None and self.is_sparse:
+            indexer_pre = self.indexer.precompute_step0_kv(
+                hidden_states, q_proj_input, positions, self.indexer_rope_emb
+            )
+        # The same cache write the attention forward performs.
+        self.mla_attn.unified_kv_update_only(kv_c_normed, k_pe)
+        return q, kv_c_normed, k_pe, indexer_pre
+
+    def forward_step0_last_rows(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attention + o_proj on the precomputed last rows only; their KV cache
+        entries were already written by precompute_step0_kv."""
+        if self.is_sparse:
+            self.mla_attn.impl.record_logical_topk_ready()
+        attn_out = self.mla_attn.unified_attention_only(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
+        )
+        return self.o_proj(attn_out)[0]

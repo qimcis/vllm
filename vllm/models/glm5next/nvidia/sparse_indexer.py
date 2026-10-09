@@ -127,6 +127,9 @@ def sparse_attn_indexer_kpool(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    # kpool insert only: skip the top-k scoring (the consumed rows are scored
+    # separately in the draft step-0 split).
+    skip_topk_scoring: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -249,7 +252,7 @@ def sparse_attn_indexer_kpool(
             )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
-    if has_prefill:
+    if has_prefill and not skip_topk_scoring:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
@@ -526,6 +529,8 @@ def sparse_attn_indexer_kpool(
                     head_dim,
                     round_scale=(scale_fmt is not None),
                 )
+        if skip_topk_scoring:
+            return topk_indices_buffer
         if current_platform.is_cuda_alike() and _fill_short_decode_causal_indices(
             topk_indices_buffer,
             positions,
@@ -695,6 +700,7 @@ class SparseAttnIndexerKpool(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        self.skip_topk_scoring = False
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
@@ -811,4 +817,5 @@ class SparseAttnIndexerKpool(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            self.skip_topk_scoring,
         )

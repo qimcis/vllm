@@ -74,6 +74,12 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
 
+    def _prepare_step0_prefill(
+        self, batch_desc: "BatchExecutionDescriptor", input_batch: "InputBatch"
+    ) -> None:
+        """Runs right before draft prefill; subclasses may prepare per-batch
+        state for the dispatched graph mode (e.g. split step-0 metadata)."""
+
     @property
     def advance_draft_positions(self) -> bool:
         """Whether to increment positions and seq_lens between draft steps.
@@ -309,6 +315,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(num_tokens)
 
+        self._prepare_step0_prefill(prefill_batch_desc, input_batch)
         self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.

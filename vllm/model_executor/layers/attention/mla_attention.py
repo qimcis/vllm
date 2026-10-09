@@ -810,6 +810,37 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if cache is not None and cache.runtime.is_group_leader:
             cache.prepare_group_for_batch(attn_metadata)
 
+    def unified_kv_update_only(
+        self, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
+    ) -> None:
+        """KV cache update without attention (draft step-0 precompute)."""
+        torch.ops.vllm.unified_mla_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            _encode_layer_name(self.layer_name),
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+
+    def unified_attention_only(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Attention without the KV cache update (draft step-0, last rows only;
+        their KV was written by the precompute pass)."""
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+        torch.ops.vllm.unified_mla_attention_with_output(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            _encode_layer_name(self.layer_name),
+        )
+        return output
+
     def forward(
         self,
         q: torch.Tensor,

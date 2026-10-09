@@ -115,6 +115,64 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
         return hidden_states, hidden_states
 
+    def precompute_step0_kv(
+        self,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> None:
+        """Step-0 region 1: fused_eh_norm -> eh_proj -> input RMSNorm -> q/kv
+        projections + RoPE, the indexer kpool insert, and the MLA cache write
+        for every row of the padded verify batch. Attention, o_proj and the MoE
+        run later on each request's last valid row only (the rows the drafter
+        actually samples from)."""
+        eh_input = fused_eh_norm(
+            positions,
+            inputs_embeds,
+            previous_hidden_states,
+            self.enorm.weight,
+            self.hnorm.weight,
+            self.enorm.variance_epsilon,
+        )
+        residual = self.eh_proj(eh_input)
+        hidden_states = self.mtp_block.input_layernorm(residual)
+        attn_pre = self.mtp_block.self_attn.mla_attn.precompute_step0_kv(
+            positions, hidden_states
+        )
+        # Consumed by forward_step0_last_rows in the same forward pass.
+        self._step0_pre = (residual, hidden_states, attn_pre)
+
+    def forward_step0_last_rows(
+        self, last_token_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Step-0 region 2: the full layer compute on the last valid row of each
+        request only. Every op here is per-row and reads rows gathered exactly
+        (no arithmetic) from the full-batch precompute, so the outputs are
+        bit-identical to running the whole layer over the padded batch."""
+        residual, hidden_states, attn_pre = self._step0_pre
+        q, kv_c_normed, k_pe, indexer_pre = attn_pre
+        residual = residual.index_select(0, last_token_indices)
+        hidden_states = hidden_states.index_select(0, last_token_indices)
+        q = q.index_select(0, last_token_indices)
+        kv_c_normed = kv_c_normed.index_select(0, last_token_indices)
+        k_pe = k_pe.index_select(0, last_token_indices)
+        mla_attn = self.mtp_block.self_attn.mla_attn
+        if mla_attn.indexer is not None and mla_attn.is_sparse:
+            q_fp8, weights = indexer_pre
+            mla_attn.indexer.score_topk_last_rows(
+                hidden_states,
+                q_fp8.index_select(0, last_token_indices),
+                weights.index_select(0, last_token_indices),
+                positions,
+            )
+        attn_output = mla_attn.forward_step0_last_rows(q, kv_c_normed, k_pe)
+        hidden_states, residual = self.mtp_block.post_attention_layernorm(
+            attn_output, residual=residual
+        )
+        hidden_states = self.mtp_block.mlp(hidden_states)
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
+        return hidden_states
+
 
 class Glm5NextMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -163,6 +221,29 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def precompute_and_store_draft_kv(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> None:
+        """Step-0 region 1 over the whole padded batch (see
+        Glm5NextMultiTokenPredictorLayer.precompute_step0_kv)."""
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        self._mtp_layers[0].precompute_step0_kv(
+            positions, previous_hidden_states, inputs_embeds
+        )
+
+    def forward_step0_last_rows(
+        self, last_token_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Step-0 region 2: one row per request (its last valid token)."""
+        return self._mtp_layers[0].forward_step0_last_rows(
+            last_token_indices, positions
+        )
 
     def forward(
         self,
@@ -242,6 +323,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def precompute_and_store_draft_kv(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> None:
+        """KV-write-only precompute for all rows of the draft step-0 batch."""
+        self.model.precompute_and_store_draft_kv(
+            input_ids, positions, hidden_states, inputs_embeds
+        )
+
+    def forward_step0_last_rows(
+        self, last_token_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Draft step-0 compute on each request's last valid row only."""
+        return self.model.forward_step0_last_rows(last_token_indices, positions)
 
     def forward(
         self,

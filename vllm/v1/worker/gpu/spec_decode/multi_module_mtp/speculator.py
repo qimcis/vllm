@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -22,6 +24,18 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class DraftStepBatchDescriptor(BatchDescriptor):
+    """Piecewise cudagraph key for one MTP draft step.
+
+    The draft loop runs one MTP module per step at the same token count, so
+    the step index must be part of the key; without it every step after the
+    first would replay the first step's captured module graph.
+    """
+
+    spec_step_idx: int = 0
 
 
 class MultiModuleMTPSpeculator(DraftModelSpeculator):
@@ -96,8 +110,14 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # TODO(TheEpicDolphin): Support piecewise cudagraph for multi-module MTP.
-        if cudagraph_mode.has_piecewise_cudagraphs():
+        # Breakable piecewise cudagraphs work for the draft loop: the
+        # eager-break ops re-read the forward context on replay. Piecewise
+        # without FULL graphs stays downgraded; the per-step key keeps mixed
+        # draft steps from sharing entries.
+        if cudagraph_mode.has_piecewise_cudagraphs() and not (
+            is_breakable_cudagraph_enabled()
+            and cudagraph_mode.has_full_cudagraphs()
+        ):
             cudagraph_mode = (
                 CUDAGraphMode.FULL_DECODE_ONLY
                 if cudagraph_mode.has_full_cudagraphs()
@@ -275,7 +295,9 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         spec_module_idx: int,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        batch_descriptor = DraftStepBatchDescriptor(
+            num_tokens=num_tokens, spec_step_idx=spec_module_idx
+        )
         with set_forward_context(
             attn_metadata,
             self.vllm_config,

@@ -524,6 +524,11 @@ class _LamportMHCDeviceKernel:
     The residual add and residual copy become the mHC post-mix of the hc
     streams, stored as the residual output, and their pre-mix collapse, which
     the unchanged RMSNorm normalizes.
+
+    With ``collapse=False`` the kernel stops after the residual store; the
+    caller collapses and normalizes the streams itself, with mixes computed
+    from the reduced result (glm5next's hc_pre reads the post-mixed streams,
+    while DSV4.1's seam carries the collapse mix in from the previous one).
     """
 
     def __init__(
@@ -536,6 +541,7 @@ class _LamportMHCDeviceKernel:
         cluster_size: int,
         rank_lanes: int,
         threads: int,
+        collapse: bool = True,
         enable_pdl: bool,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
@@ -553,6 +559,7 @@ class _LamportMHCDeviceKernel:
         self.cluster_size = cluster_size
         self.rank_lanes = rank_lanes
         self.threads = threads
+        self.collapse = collapse
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
         self.groups_per_cta = threads // rank_lanes
@@ -753,8 +760,11 @@ class _LamportMHCDeviceKernel:
                 # The all-reduced sublayer output is BF16, as the unfused
                 # collective returns it, before mHC post mixes it in.
                 reduced = lane_sum.load().to(BFloat16).to(Float32)
-                collapse = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
-                collapse.fill(Float32(0.0))
+                if cutlass.const_expr(self.collapse):
+                    collapse = cute.make_rmem_tensor(
+                        cute.make_layout((VEC_BF16,)), Float32
+                    )
+                    collapse.fill(Float32(0.0))
                 for target in cutlass.range_constexpr(hc):
                     mixed = reduced * post_mix[target]
                     for source in cutlass.range_constexpr(hc):
@@ -771,10 +781,12 @@ class _LamportMHCDeviceKernel:
                         Int64((residual_output.iterator + output_element).toint()),
                         bf16x8_to_packed_u32x4(mixed_bf16),
                     )
-                    collapse.store(
-                        collapse.load() + mixed_bf16.to(Float32) * pre_mix[target]
-                    )
-                prenorm_fragments[trip, None].store(collapse.load().to(BFloat16))
+                    if cutlass.const_expr(self.collapse):
+                        collapse.store(
+                            collapse.load() + mixed_bf16.to(Float32) * pre_mix[target]
+                        )
+                if cutlass.const_expr(self.collapse):
+                    prenorm_fragments[trip, None].store(collapse.load().to(BFloat16))
 
         if token == 0 and cluster_rank == 0 and tidx == 0:
             store_global_u32(
@@ -798,56 +810,59 @@ class _LamportMHCDeviceKernel:
                         Int64((contribution_mailbox.iterator + source_element).toint())
                     )
 
-        thread_sum = Float32(0.0)
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments and rank_lane == 0:
-                values = prenorm_fragments[trip, None].load().to(Float32)
-                thread_sum = thread_sum + (values * values).reduce(
-                    cute.ReductionOp.ADD,
-                    init_val=Float32(0.0),
-                    reduction_profile=0,
-                )
+        if cutlass.const_expr(self.collapse):
+            thread_sum = Float32(0.0)
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments and rank_lane == 0:
+                    values = prenorm_fragments[trip, None].load().to(Float32)
+                    thread_sum = thread_sum + (values * values).reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=Float32(0.0),
+                        reduction_profile=0,
+                    )
 
-        smem = cutlass.utils.SmemAllocator()
-        warp_sums = smem.allocate_array(Float32, self.warps)
-        cluster_sums = smem.allocate_array(Float32, self.cluster_size)
-        cta_sum = _group_leader_block_sum(
-            thread_sum,
-            warp_sums,
-            self.warps,
-            self.rank_lanes,
-        )
-        if tidx < self.cluster_size:
-            local_slot = cluster_sums + cluster_rank
-            remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-            store_shared_cluster_f32(remote_slot, cta_sum)
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-        full_sum = Float32(0.0)
-        for peer in cutlass.range_constexpr(self.cluster_size):
-            full_sum = full_sum + cute.arch.load(
-                (cluster_sums + peer).llvm_ptr,
-                Float32,
+            smem = cutlass.utils.SmemAllocator()
+            warp_sums = smem.allocate_array(Float32, self.warps)
+            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+            cta_sum = _group_leader_block_sum(
+                thread_sum,
+                warp_sums,
+                self.warps,
+                self.rank_lanes,
             )
-        inv_rms = cute.math.rsqrt(
-            full_sum / Float32(self.hidden) + eps,
-            fastmath=True,
-        )
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments and rank_lane == 0:
-                gamma_values = gamma_fragments[trip, None].load().to(Float32)
-                result = (
-                    prenorm_fragments[trip, None].load().to(Float32)
-                    * inv_rms
-                    * gamma_values
-                ).to(BFloat16)
-                output_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
-                store_global_u32x4(
-                    Int64((norm_output.iterator + output_element).toint()),
-                    bf16x8_to_packed_u32x4(result),
+            if tidx < self.cluster_size:
+                local_slot = cluster_sums + cluster_rank
+                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                store_shared_cluster_f32(remote_slot, cta_sum)
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            full_sum = Float32(0.0)
+            for peer in cutlass.range_constexpr(self.cluster_size):
+                full_sum = full_sum + cute.arch.load(
+                    (cluster_sums + peer).llvm_ptr,
+                    Float32,
                 )
+            inv_rms = cute.math.rsqrt(
+                full_sum / Float32(self.hidden) + eps,
+                fastmath=True,
+            )
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments and rank_lane == 0:
+                    gamma_values = gamma_fragments[trip, None].load().to(Float32)
+                    result = (
+                        prenorm_fragments[trip, None].load().to(Float32)
+                        * inv_rms
+                        * gamma_values
+                    ).to(BFloat16)
+                    output_element = (
+                        Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+                    )
+                    store_global_u32x4(
+                        Int64((norm_output.iterator + output_element).toint()),
+                        bf16x8_to_packed_u32x4(result),
+                    )
 
 
 class AllReduceMHC:
@@ -856,9 +871,12 @@ class AllReduceMHC:
     ``__call__`` reduces ``x`` across the TP group, writes the post-mixed hc
     streams and the normalized collapse, and leaves the next mixes to the
     caller. ``finalize`` does the same for an unfinalized MoE output, folding
-    the top-k reduction and the shared-expert add into the publish. Each
-    instance owns a Lamport mailbox; construction is collective over the TP
-    group.
+    the top-k reduction and the shared-expert add into the publish. With
+    ``collapse=False`` the consumer stops after the post-mix and
+    ``reduce_post``/``finalize_post`` return only the mixed streams, leaving
+    the collapse and its mixes (computed from the reduced streams) to the
+    caller. Each instance owns a Lamport mailbox; construction is collective
+    over the TP group.
     """
 
     def __init__(
@@ -869,20 +887,24 @@ class AllReduceMHC:
         max_num_tokens: int,
         top_k: int,
         device: torch.device,
+        collapse: bool = True,
+        fp32_weights: bool = True,
     ) -> None:
         group = get_tp_group().device_group
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
         self.capacity = capacity = max_num_tokens
         self.top_k = top_k
+        self.collapse = collapse
         tp = dist.get_world_size(group)
         rank = dist.get_rank(group)
         device = torch.device(device)
 
         # FlashInfer's LL_ALL_REDUCE_GB300_TP{4,8}_H5120 and
-        # LL_FINALIZE_..._H5120_K* presets: a cluster of 5 x 128 threads covers
-        # a 640-fragment token in one fully used trip, and the finalize stages
-        # all top_k rows at once.
+        # LL_FINALIZE_..._H5120_K* presets: a cluster covering a token's
+        # fragments in one fully used trip (5 x 128 threads for DSV4.1's
+        # 640-fragment token, 4 for glm5next's 512), and a finalize that
+        # stages all top_k rows at once.
         with torch.accelerator.device_index(device.index):
             self._publish = cute.compile(
                 _SharedOnlyPublishDeviceKernel(
@@ -911,19 +933,23 @@ class AllReduceMHC:
                     rank=rank,
                     capacity_m=capacity,
                     threads=128,
-                    # DSV4.1's router folds the scale into the weights.
+                    # DSV4.1's router folds the scale into the weights; the
+                    # monolithic TRTLLM router of glm5next does the same but
+                    # emits BF16 weights.
                     routed_scaling_factor=1.0,
                     include_shared_expert=True,
                     load_shared_expert_before_pdl=False,
                     enable_pdl=True,
                     prefetch_group=top_k,
-                    fp32_weights=True,
+                    fp32_weights=fp32_weights,
                 ),
                 make_fake_dynamic_compact_tensor(
                     BFloat16, alignment=16, divisibility=hidden
                 ),
                 make_fake_dynamic_compact_tensor(
-                    Float32, alignment=4, divisibility=top_k
+                    Float32 if fp32_weights else BFloat16,
+                    alignment=4 if fp32_weights else 2,
+                    divisibility=top_k,
                 ),
                 make_fake_dynamic_compact_tensor(
                     Int32, alignment=4, divisibility=top_k
@@ -942,9 +968,10 @@ class AllReduceMHC:
                     hc=hc,
                     tp=tp,
                     capacity_m=capacity,
-                    cluster_size=5,
+                    cluster_size=(hidden // VEC_BF16) // 128,
                     rank_lanes=1,
                     threads=128,
+                    collapse=collapse,
                     enable_pdl=True,
                 ),
                 make_fake_compact_tensor(
@@ -986,6 +1013,13 @@ class AllReduceMHC:
             # Every slot starts as the Lamport sentinel, BF16 negative zero.
             self._mailbox.view(torch.int16).fill_(-32768)
             self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
+            if not collapse:
+                # Stand-ins for the collapse's pre-mix, gamma and norm output,
+                # which the post-only consumer never dereferences.
+                self._post_pre = torch.empty(hc, dtype=torch.float32, device=device)
+                self._post_norm = torch.empty(
+                    hidden, dtype=torch.bfloat16, device=device
+                )
             torch.accelerator.synchronize()
         dist.barrier(group=group)
 
@@ -1082,6 +1116,89 @@ class AllReduceMHC:
         )
         return self._collect(residual, post, comb, pre, norm_weight, norm_eps, m)
 
+    def reduce_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the post-mixed residual streams for a TP-partial ``x``.
+
+        ``__call__`` without the collapse: the caller computes the collapse and
+        the next mixes from the returned streams.
+
+        Args:
+            x: [M, hidden] BF16 TP-partial sublayer output.
+            residual: [M, hc, hidden] BF16 residual streams.
+            post: [M, hc(, 1)] FP32 post-mix.
+            comb: [M, hc, hc] FP32 residual mix, indexed [source, target].
+
+        """
+        m = x.shape[0]
+        self._check_post(m, residual, post, comb)
+        if x.shape != (m, self.hidden_size):
+            raise ValueError("unexpected x shape")
+        self._publish(
+            to_cute_dynamic(x.flatten(), 16, divisibility=self.hidden_size),
+            to_cute(self._stage_state, 4),
+            Int64(self._multicast),
+            Int32(m),
+            current_cu_stream(),
+        )
+        return self._collect_post(residual, post, comb, m)
+
+    def finalize_post(
+        self,
+        gemm2_permuted: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        shared_output: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """``reduce_post`` for a MoE output left unfinalized.
+
+        Args:
+            gemm2_permuted: [rows, hidden] BF16 unweighted GEMM2 output in the
+                MoE's permuted order.
+            expert_weights: [M, top_k] routing weights in the dtype the MoE
+                kernel emitted (FP32 for modular, BF16 for monolithic TRTLLM
+                experts), already scaled.
+            expanded_idx_to_permuted_idx: [M, top_k] int32 row of each route,
+                -1 for an expert this rank does not hold.
+            shared_output: [M, hidden] BF16 TP-partial shared-expert output.
+            residual: [M, hc, hidden] BF16 residual streams.
+            post: [M, hc(, 1)] FP32 post-mix.
+            comb: [M, hc, hc] FP32 residual mix, indexed [source, target].
+
+        """
+        m = shared_output.shape[0]
+        hidden, top_k = self.hidden_size, self.top_k
+        self._check_post(m, residual, post, comb)
+        if gemm2_permuted.dim() != 2 or gemm2_permuted.shape[1] != hidden:
+            raise ValueError("gemm2_permuted must be [rows, hidden]")
+        if shared_output.shape != (m, hidden):
+            raise ValueError("unexpected shared_output shape")
+        if expert_weights.numel() != m * top_k:
+            raise ValueError("expert_weights must be [M, top_k]")
+        if expanded_idx_to_permuted_idx.numel() != m * top_k:
+            raise ValueError("expanded_idx_to_permuted_idx must be [M, top_k]")
+        self._finalize_publish(
+            to_cute_dynamic(gemm2_permuted.flatten(), 16, divisibility=hidden),
+            to_cute_dynamic(expert_weights.flatten(), 2, divisibility=top_k),
+            to_cute_dynamic(
+                expanded_idx_to_permuted_idx.flatten(), 4, divisibility=top_k
+            ),
+            to_cute_dynamic(shared_output.flatten(), 16, divisibility=hidden),
+            to_cute(self._stage_state, 4),
+            Int64(self._multicast),
+            Int32(m),
+            current_cu_stream(),
+        )
+        return self._collect_post(residual, post, comb, m)
+
     def _check(
         self,
         m: int,
@@ -1090,16 +1207,24 @@ class AllReduceMHC:
         comb: torch.Tensor,
         pre: torch.Tensor,
     ) -> None:
+        self._check_post(m, residual, post, comb)
+        hc = self.hc_mult
+        if pre.numel() != m * hc:
+            raise ValueError("unexpected mix shapes")
+
+    def _check_post(
+        self,
+        m: int,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> None:
         hc = self.hc_mult
         if not 1 <= m <= self.capacity:
             raise ValueError(f"M={m} is outside [1, {self.capacity}]")
         if residual.shape != (m, hc, self.hidden_size):
             raise ValueError("unexpected residual shape")
-        if (
-            post.numel() != m * hc
-            or pre.numel() != m * hc
-            or comb.numel() != m * hc * hc
-        ):
+        if post.numel() != m * hc or comb.numel() != m * hc * hc:
             raise ValueError("unexpected mix shapes")
 
     def _collect(
@@ -1132,3 +1257,28 @@ class AllReduceMHC:
             current_cu_stream(),
         )
         return residual_output, layer_input
+
+    def _collect_post(
+        self,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        m: int,
+    ) -> torch.Tensor:
+        hidden, hc = self.hidden_size, self.hc_mult
+        residual_output = torch.empty_like(residual)
+        self._collective(
+            to_cute(self._mailbox.flatten(), 16),
+            to_cute_dynamic(residual.flatten(), 16, divisibility=hc * hidden),
+            to_cute_dynamic(post.flatten(), 4, divisibility=hc),
+            to_cute_dynamic(comb.flatten(), 4, divisibility=hc * hc),
+            to_cute_dynamic(self._post_pre, 4, divisibility=hc),
+            to_cute(self._post_norm, 16),
+            to_cute_dynamic(residual_output.flatten(), 16, divisibility=hc * hidden),
+            to_cute_dynamic(self._post_norm, 16, divisibility=hidden),
+            to_cute(self._stage_state, 4),
+            Float32(0.0),
+            Int32(m),
+            current_cu_stream(),
+        )
+        return residual_output

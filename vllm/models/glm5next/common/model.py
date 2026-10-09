@@ -15,7 +15,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import in_piecewise_cudagraph
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -23,6 +25,14 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsMonolithic,
+)
+from vllm.model_executor.layers.fused_moe.moe_output import (
+    MoEOutput,
+    UnfinalizedMoEOutput,
+)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
     resolve_layer_fused_shared_expert,
@@ -86,6 +96,12 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
     sp_shard,
+)
+from vllm.models.glm5next.nvidia.ops.mhc import (
+    MHC_ALL_REDUCE_MAX_TOKENS,
+    init_mhc_all_reduce,
+    mhc_all_reduce_post,
+    supports_mhc_all_reduce,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
@@ -214,6 +230,7 @@ class Glm5NextMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -305,6 +322,7 @@ class Glm5NextMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            reduce_results=reduce_results,
             n_shared_experts=config.n_shared_experts
             if self.is_fused_shared_expert_enabled
             else None,
@@ -313,6 +331,41 @@ class Glm5NextMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
             swiglu_limit=swiglu_limit,
         )
+
+    def defer_finalize(self) -> None:
+        """Leave the routed top-k reduction to the next fused all-reduce + mHC.
+
+        Only the monolithic TRTLLM NVFP4 experts stop after GEMM2 under the
+        glm5next deployment this targets; their router folds the routed scale
+        into the BF16 weights the fused kernel takes as-is.
+        """
+        experts_cls = getattr(
+            self.experts.routed_experts.quant_method, "experts_cls", None
+        )
+        if (
+            experts_cls is TrtLlmNvFp4ExpertsMonolithic
+            and self.experts.routed_scaling_factor == 1.0
+        ):
+            self.experts.moe_config.defer_moe_finalize(MHC_ALL_REDUCE_MAX_TOKENS)
+            if self.experts.moe_config.use_deferred_moe_finalize:
+                logger.info_once(
+                    "glm5next mHC: MoE top-k finalize fused into the all-reduce "
+                    "for up to %d tokens.",
+                    MHC_ALL_REDUCE_MAX_TOKENS,
+                )
+
+    def defers_finalize(self, num_tokens: int) -> bool:
+        return self.experts.moe_config.should_defer_moe_finalize(num_tokens)
+
+    def forward_unfinalized(self, hidden_states: torch.Tensor) -> MoEOutput:
+        """``forward`` with the routed top-k reduction and all-reduce left open."""
+        # The runner's custom op returns tensors only, so run its body directly.
+        shared_output, routed = _unpack(
+            self.experts._forward_impl(hidden_states, hidden_states, hidden_states)
+        )
+        assert shared_output is not None
+        assert isinstance(routed, UnfinalizedMoEOutput)
+        return MoEOutput(routed=routed, shared_output=shared_output)
 
     def forward(
         self,
@@ -351,6 +404,7 @@ class Glm5NextDecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         is_mtp_layer: bool = False,
+        fuse_mhc_all_reduce: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -370,6 +424,10 @@ class Glm5NextDecoderLayer(nn.Module):
         is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # The mHC boundaries of a non-MTP layer reduce through the fused
+        # Lamport all-reduce; every other execution mode keeps the plain
+        # collective on the seam.
+        self.fuse_mhc_all_reduce = fuse_mhc_all_reduce and self.mhc and not is_mtp_layer
 
         if is_kda_layer:
             self.self_attn = Glm5NextLinearAttention(
@@ -415,6 +473,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.fuse_mhc_all_reduce,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -422,6 +481,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self.fuse_mhc_all_reduce,
                 is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
@@ -432,8 +492,9 @@ class Glm5NextDecoderLayer(nn.Module):
         # In SP, the attention output projection leaves a partial sum; the
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
-        # their o_proj must still reduce normally.
-        if self.is_sequence_parallel and not is_mtp_layer:
+        # their o_proj must still reduce normally. The fused mHC all-reduce
+        # consumes the o_proj partial the same way.
+        if (self.is_sequence_parallel and not is_mtp_layer) or self.fuse_mhc_all_reduce:
             self.self_attn.o_proj.reduce_results = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -568,7 +629,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
         else:
-            residual, post, comb, x = self.hc_fused_post_pre(
+            residual, post, comb, x = self.hc_boundary(
                 x,
                 residual,
                 post,
@@ -594,7 +655,7 @@ class Glm5NextDecoderLayer(nn.Module):
             x = sp_reduce_scatter(x)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
-        residual, post, comb, x = self.hc_fused_post_pre(
+        residual, post, comb, x = self.hc_boundary(
             x,
             residual,
             post,
@@ -608,7 +669,12 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # Fully Connected
         if self._mlp_is_moe:
-            x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+            if self.fuse_mhc_all_reduce and self.mlp.defers_finalize(x.shape[0]):
+                # The next layer's first boundary finalizes it with the
+                # fused all-reduce.
+                x = self.mlp.forward_unfinalized(x)
+            else:
+                x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
 
@@ -616,6 +682,10 @@ class Glm5NextDecoderLayer(nn.Module):
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
         if self.layer_idx == self.num_hidden_layers - 1:
+            if self.fuse_mhc_all_reduce:
+                # No successor boundary: the plain all-reduce feeds the
+                # final hc_post.
+                x = tensor_model_parallel_all_reduce(x)
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
             return x, None, None, None
@@ -686,6 +756,62 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_eps=norm_eps,
         )
 
+    def hc_boundary(
+        self,
+        x: torch.Tensor | MoEOutput,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ):
+        """One all-reduce -> hc_post + hc_pre boundary.
+
+        The fused path publishes the TP-partial sublayer output into the
+        Lamport mailbox and post-mixes it inside the consumer; the collapse,
+        the RMSNorm and the next mixes then come from hc_pre on the reduced
+        streams. It runs for small batches in FULL graphs only, and for any
+        MoE output left unfinalized, which only the fused consumer can
+        finalize.
+        """
+        if self.fuse_mhc_all_reduce and (
+            isinstance(x, MoEOutput)
+            or (
+                0 < residual.shape[0] <= MHC_ALL_REDUCE_MAX_TOKENS
+                and not in_piecewise_cudagraph()
+                and torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            residual = mhc_all_reduce_post(x, residual, post, comb)
+            post, comb, layer_input = self.hc_pre(
+                residual,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+            return residual, post, comb, layer_input
+        assert isinstance(x, torch.Tensor)
+        if self.fuse_mhc_all_reduce:
+            # The producers left a partial; the fused path is off for this
+            # call, so the plain collective completes it.
+            x = tensor_model_parallel_all_reduce(x)
+        return self.hc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
 
 class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -730,6 +856,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # The fused Lamport all-reduce + mHC post replaces the plain
+        # collective on every decoder boundary it can.
+        self.fuse_mhc_all_reduce = bool(config.mhc) and supports_mhc_all_reduce(
+            vllm_config
+        )
+        if self.fuse_mhc_all_reduce:
+            init_mhc_all_reduce(vllm_config)
+
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
             return Glm5NextDecoderLayer(
@@ -738,6 +872,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 layer_idx=layer_idx,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -749,6 +884,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        if self.fuse_mhc_all_reduce:
+            # A MoE's top-k finalize folds into the next layer's first mHC
+            # boundary, which the last layer lacks (its own final hc_post is
+            # the plain fallback).
+            for layer, successor in zip(self._active_layers, self._active_layers[1:]):
+                assert isinstance(successor, Glm5NextDecoderLayer)
+                if isinstance(layer, Glm5NextDecoderLayer) and isinstance(
+                    layer.mlp, Glm5NextMoE
+                ):
+                    layer.mlp.defer_finalize()
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers, Glm5NextMoE, "mlp"
         )

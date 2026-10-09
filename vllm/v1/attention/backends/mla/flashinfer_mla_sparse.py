@@ -592,20 +592,87 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
-        else:
-            topk_indices_physical, seq_lens = self._convert_logical_to_physical_topk(
-                topk_indices,
-                attn_metadata,
-                block_stride_rows=block_stride_rows,
-                return_valid_counts=True,
+            return self._run_mqa_kernel(
+                q, kv_c_and_k_pe_cache, topk_indices_physical, seq_lens
             )
 
-        return self._run_mqa_kernel(
-            q,
-            kv_c_and_k_pe_cache,
-            topk_indices_physical,
-            seq_lens,
+        topk_indices_physical, seq_lens = self._convert_logical_to_physical_topk(
+            topk_indices,
+            attn_metadata,
+            block_stride_rows=block_stride_rows,
+            return_valid_counts=True,
         )
+
+        groups = self._mqa_row_groups(attn_metadata, num_actual_toks)
+        if groups is None:
+            return self._run_mqa_kernel(
+                q, kv_c_and_k_pe_cache, topk_indices_physical, seq_lens
+            )
+        outputs: list[torch.Tensor] = []
+        lses: list[torch.Tensor | None] = []
+        for row_start, num_seqs, q_len in groups:
+            row_end = row_start + num_seqs * q_len
+            out, lse = self._run_mqa_kernel(
+                q[row_start:row_end],
+                kv_c_and_k_pe_cache,
+                topk_indices_physical[row_start:row_end],
+                seq_lens[row_start:row_end],
+                num_seqs=num_seqs,
+            )
+            outputs.append(out)
+            lses.append(lse)
+        if len(outputs) == 1:
+            return outputs[0], lses[0]
+        assert all(lse is None for lse in lses)
+        return torch.cat(outputs), None
+
+    def _mqa_row_groups(
+        self,
+        attn_metadata: FlashInferMLASparseMetadata,
+        num_actual_toks: int,
+    ) -> list[tuple[int, int, int]] | None:
+        """Split the MQA rows into runs that share one per-request query length.
+
+        Rows arrive request-grouped with decode requests first, and the
+        trtllm-gen kernel takes a single q_len for the whole call, so only
+        runs with a uniform per-request query length can use the grouped
+        layout; ragged runs keep the q_len=1 layout. Returns (row_start,
+        num_seqs, q_len) triples, or None when no run can be grouped.
+        """
+        # Grouping relies on the per-token sparse_mla_top_k_lens bound to keep
+        # each token's selection exact; the rope path has no per-token bound,
+        # and DCP keeps the flat layout (all-gathered heads, LSE for combine).
+        if not self.is_nope_mla or self.dcp_world_size > 1:
+            return None
+
+        groups: list[tuple[int, int, int]] = []
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        if num_decode_tokens > 0:
+            dq_len = attn_metadata.decode_max_query_len
+            if dq_len > 0 and num_decode_tokens == attn_metadata.num_decodes * dq_len:
+                groups.append((0, attn_metadata.num_decodes, dq_len))
+            else:
+                groups.append((0, num_decode_tokens, 1))
+
+        num_prefill_tokens = num_actual_toks - num_decode_tokens
+        if num_prefill_tokens > 0:
+            prefill = attn_metadata.prefill
+            query_lens_cpu = prefill.query_lens_cpu if prefill is not None else None
+            if (
+                query_lens_cpu is not None
+                and query_lens_cpu.numel() > 0
+                and int(query_lens_cpu.sum()) == num_prefill_tokens
+                and bool((query_lens_cpu == query_lens_cpu[0]).all())
+            ):
+                groups.append(
+                    (num_decode_tokens, query_lens_cpu.numel(), int(query_lens_cpu[0]))
+                )
+            else:
+                groups.append((num_decode_tokens, num_prefill_tokens, 1))
+
+        if all(q_len == 1 for _, _, q_len in groups):
+            return None
+        return groups
 
     def _prepare_mqa_kernel(
         self,
@@ -673,6 +740,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         kv_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        num_seqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert self._workspace_buffer is not None
         assert self.bmm1_scale is not None
@@ -682,14 +750,27 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         kv_cache = kv_cache.view(q.dtype)
 
-        # Single-token sparse decode. trtllm-gen requires the q_len_per_request
-        # dim, but the sparse attention mask is fully per-token (each query token
-        # carries its own top-k index row), so unsqueeze is sufficient and
-        # correct. The MTP/multi-token q_len grouping is a perf-only layout and is
-        # deferred until MTP is validated end-to-end for this backend.
-        query = q.unsqueeze(1)
-        block_tables = topk_indices.unsqueeze(1)
-        seq_lens_arg = seq_lens
+        # trtllm-gen requires the q_len_per_request dim, but the sparse
+        # attention mask is fully per-token (each query token carries its own
+        # top-k index row, plus a per-token sparse_mla_top_k_lens entry for
+        # no-rope models), so one entry per token is sufficient and correct.
+        # Grouping rows that share a per-request query length folds that
+        # shared dimension into the kernel's q_len and is a perf-only layout
+        # change.
+        if num_seqs is None:
+            query = q.unsqueeze(1)
+            block_tables = topk_indices.unsqueeze(1)
+            seq_lens_arg = seq_lens
+        else:
+            q_len = q.shape[0] // num_seqs
+            query = q.view(num_seqs, q_len, q.shape[1], q.shape[2])
+            block_tables = topk_indices.view(num_seqs, q_len, -1)
+            # The kernel bounds each request's scheduled KV tiles by seq_lens
+            # while sparse_mla_top_k_lens keeps the per-token bound, so the
+            # per-request value must cover every token in the group.
+            seq_lens_arg = (
+                seq_lens if q_len == 1 else seq_lens.view(num_seqs, q_len).amax(dim=1)
+            )
 
         # page_table width = topk buffer width, which kpool widens past
         # index_topk (topk_tokens) and rounds up to a multiple of 128. The

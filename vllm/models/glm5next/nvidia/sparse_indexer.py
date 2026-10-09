@@ -24,6 +24,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
     kv_cache_as_quant_view,
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+from vllm.models.glm5next.nvidia.ops import mqa_logits
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import has_deep_gemm
 from vllm.utils.import_utils import has_cutedsl
@@ -331,6 +332,16 @@ def sparse_attn_indexer_kpool(
             num_rows = q_slice.shape[0]
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
+            elif not use_fp4_cache and q_slice_cast.shape[1] == 16:
+                # index_n_heads=16: Triton kernel instead of the {32,64}-head
+                # DeepGEMM op, avoiding the zero-pad to 32 heads.
+                logits = mqa_logits.fp8_mqa_logits_prefill(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             else:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
@@ -579,17 +590,27 @@ def sparse_attn_indexer_kpool(
         )
         from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            padded_weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_pool_len,
-            clean_logits=False,
-            indices=decode_metadata.indices,
-        )
+        if not use_fp4_cache and padded_q_quant_cast.shape[2] == 16:
+            logits = mqa_logits.fp8_mqa_logits_paged(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=max_pool_len,
+            )
+        else:
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_pool_len,
+                clean_logits=False,
+                indices=decode_metadata.indices,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.

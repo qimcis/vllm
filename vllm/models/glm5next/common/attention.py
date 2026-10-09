@@ -397,11 +397,12 @@ class Indexer(nn.Module):
         gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
-        # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
-        # checkpoint uses index_n_heads=16. Zero-pad q and the per-head
-        # weights: logits are a weights-weighted sum over heads, so
+        # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}.
+        # num_heads == 16 runs unpadded on the Triton kernels in
+        # nvidia/ops/mqa_logits.py. Zero-pad any other sub-32 head count:
+        # logits are a weights-weighted sum over heads, so
         # zero-weight padded heads contribute exactly nothing.
-        if self.n_head < 32:
+        if self.n_head < 32 and self.n_head != 16:
             pad = 32 - self.n_head
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)

@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
+from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
 if TYPE_CHECKING:
@@ -267,6 +268,28 @@ class FlashInferMLASparseMetadataBuilder(
             threshold,
             supports_spec_as_decode=True,
             supports_dcp_with_varlen=True,
+        )
+        # Fused draft decode reuses one metadata build across draft steps;
+        # step-dependent fields are live views of runner buffers. DCP and the
+        # HiSparse decode path are excluded until separately validated.
+        self.supports_draft_decode_metadata_update = (
+            self.dcp_world_size == 1
+            and self.vllm_config.attention_config.hisparse_config is None
+        )
+
+    def update_draft_decode_metadata(
+        self, metadata: FlashInferMLASparseMetadata
+    ) -> None:
+        num_tokens = metadata.num_decode_tokens
+        if num_tokens == 0:
+            return
+        # Everything else is a view of runner buffers; the per-token request
+        # map is a builder buffer that build() filled for the captured batch.
+        compute_token_to_req_indices(
+            metadata.query_start_loc,
+            metadata.req_id_per_token,
+            num_tokens,
+            num_tokens,
         )
 
 

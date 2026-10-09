@@ -429,6 +429,10 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # build() plans on host from step-1 lengths; the plan cannot be
+        # refreshed in-graph between draft steps, so keep the fused draft
+        # loop off for this backend.
+        self.supports_draft_decode_metadata_update = False
         attention_layer = vllm_config.compilation_config.static_forward_context[
             layer_names[0]
         ]

@@ -45,6 +45,7 @@ from vllm.model_executor.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -177,27 +178,52 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
     def get_state_dtype(
         self,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
-        return MambaStateDtypeCalculator.kda_state_dtype(
+        base_dtypes = MambaStateDtypeCalculator.kda_state_dtype(
             self.model_config.dtype, self.cache_config.mamba_cache_dtype
         )
+        if self.cache_config.use_kda_recoverssm:
+            return MambaStateDtypeCalculator.append_kda_recoverssm_record(
+                base_dtypes, self.model_config.dtype
+            )
+        return base_dtypes
 
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    ) -> tuple[tuple[int, ...], ...]:
         # conv_state width must include num_spec so the spec-decode conv update
         # (causal_conv1d_update with num_accepted_tokens + max_query_len) can
         # slide the window across the draft-verify tokens without reading past
         # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.
-        return MambaStateShapeCalculator.kda_state_shape(
+        base_shapes = MambaStateShapeCalculator.kda_state_shape(
             self.tp_size,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
             num_spec=self.num_spec,
         )
+        if self.cache_config.use_kda_recoverssm:
+            # Replay records: per-token fp32 v-corrections and raw [k, gate]
+            # activations, replacing the per-draft-token state slots.
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                base_shapes,
+                self.num_heads,
+                self.head_dim,
+                tp_world_size=self.tp_size,
+                spec_query_len=1 + self.num_spec,
+            )
+        return base_shapes
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.cache_config.use_kda_recoverssm:
+            from vllm.models.glm5next.nvidia.kda_metadata import (
+                Glm5NextKDAAttentionBackend,
+            )
+
+            return Glm5NextKDAAttentionBackend
+        return super().get_attn_backend()
 
     def __init__(
         self,
@@ -540,7 +566,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        (conv_state, recurrent_state) = constant_caches
+        (conv_state, recurrent_state, *recoverssm_records) = constant_caches
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         # Layout is process-global and resolved once at init (see __init__).
@@ -601,7 +627,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
-            conv_mql = spec_state_indices_tensor.size(-1)
+            # RecoverSSM keeps one checkpoint slot per request, so the window
+            # length cannot be read off the state indices.
+            conv_mql = (
+                1 + self.num_spec
+                if self.cache_config.use_kda_recoverssm
+                else spec_state_indices_tensor.size(-1)
+            )
             qkv_spec = causal_conv1d_update(
                 qkv_spec,
                 conv_state,
@@ -665,27 +697,59 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
-            # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
-            # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
-            # skips its launch + fp32 [n, H, D] intermediate per layer.
-            core_attn_out_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_spec),
-                k=_rearr(k_spec),
-                v=_rearr(v_spec),
-                g=g1_spec,
-                beta=beta_spec,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                out=spec_out,
-                sigmoid_beta=True,
-                a_log=self.A_log,
-                g_bias=self.dt_bias,
-                compute_gate=True,
-                lower_bound=lower_bound,
-            )
+            if self.cache_config.use_kda_recoverssm:
+                # RecoverSSM: verify the whole window from the read-only
+                # checkpoint, recording per-token [v-correction, k, gate]
+                # replay entries instead of one state slot per draft token.
+                # The commit kernel folds the accepted records into the
+                # checkpoint after sampling.
+                from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                    kda_recoverssm_verify,
+                )
+
+                if len(recoverssm_records) != 2:
+                    raise ValueError(
+                        "GLM RecoverSSM requires correction and key/gate buffers"
+                    )
+                core_attn_out_spec = kda_recoverssm_verify(
+                    q=_rearr(q_spec),
+                    k=_rearr(k_spec),
+                    v=_rearr(v_spec),
+                    raw_g=g1_spec,
+                    raw_beta=beta_spec,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    lower_bound=lower_bound,
+                    checkpoint_state=recurrent_state,
+                    correction_cache=recoverssm_records[0],
+                    kg_cache=recoverssm_records[1],
+                    query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],
+                    state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],
+                    spec_query_len=1 + self.num_spec,
+                    out=spec_out,
+                )
+            else:
+                # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
+                # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
+                # skips its launch + fp32 [n, H, D] intermediate per layer.
+                core_attn_out_spec, _ = fused_recurrent_kda(
+                    q=_rearr(q_spec),
+                    k=_rearr(k_spec),
+                    v=_rearr(v_spec),
+                    g=g1_spec,
+                    beta=beta_spec,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                    out=spec_out,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None

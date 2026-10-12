@@ -128,13 +128,14 @@ __device__ __forceinline__ float nvfp4_tile_scale(const float* vals,
 // Warp 1: 32 threads, two RoPE elements each.
 __global__ void concat_and_cache_nvfp4_ds_mla_kernel(
     const __nv_bfloat16* __restrict__ kv_c,    // [num_tokens, 512]
-    const __nv_bfloat16* __restrict__ k_pe,    // [num_tokens, 64]
+    const __nv_bfloat16* __restrict__ k_pe,    // [num_tokens, pe_dim]
     uint8_t* __restrict__ kv_cache,            // [num_blocks, block_size, 352]
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int block_stride,                    //
     const int entry_stride,                    //
     const int kv_c_stride,                     //
     const int k_pe_stride,                     //
+    const int pe_dim,                          // 64, or 0 for NoPE
     const int block_size) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -165,6 +166,10 @@ __global__ void concat_and_cache_nvfp4_ds_mla_kernel(
     // Plain e4m3, unscaled. All 32 lanes take 2 elements each, matching the
     // reader and concat_and_cache_ds_mla_kernel.
     const int lane = threadIdx.x - 32;
+    if (pe_dim == 0) {
+      *reinterpret_cast<uint16_t*>(token_ptr + 256 + lane * 2) = 0;
+      return;
+    }
     const __nv_bfloat16* src = k_pe + token_idx * k_pe_stride + lane * 2;
     uint8_t q[2];
 #pragma unroll
@@ -241,15 +246,15 @@ void launch_concat_and_cache_nvfp4_ds_mla(const void* kv_c, const void* k_pe,
                                           const int64_t* slot_mapping,
                                           int block_stride, int entry_stride,
                                           int kv_c_stride, int k_pe_stride,
-                                          int block_size, int num_tokens,
-                                          cudaStream_t stream) {
+                                          int pe_dim, int block_size,
+                                          int num_tokens, cudaStream_t stream) {
   dim3 grid(num_tokens);
   dim3 block(64);  // warp 0: 32 NoPE tiles; warp 1: 4 RoPE tiles
   concat_and_cache_nvfp4_ds_mla_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(kv_c),
       reinterpret_cast<const __nv_bfloat16*>(k_pe),
       reinterpret_cast<uint8_t*>(kv_cache), slot_mapping, block_stride,
-      entry_stride, kv_c_stride, k_pe_stride, block_size);
+      entry_stride, kv_c_stride, k_pe_stride, pe_dim, block_size);
 }
 
 void launch_cp_gather_and_upconvert_nvfp4_kv_cache(

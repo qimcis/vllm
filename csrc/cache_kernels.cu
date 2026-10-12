@@ -951,7 +951,8 @@ void concat_and_cache_mla(
     constexpr int bytes_per_token = 352;
     STD_TORCH_CHECK(kv_lora_rank == 512, "kv_lora_rank must be 512 for ",
                     kv_cache_dtype);
-    STD_TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for ", kv_cache_dtype);
+    STD_TORCH_CHECK(pe_dim == 64 || pe_dim == 0, "pe_dim must be 64 or 0 for ",
+                    kv_cache_dtype);
     STD_TORCH_CHECK(
         kv_cache.size(2) == bytes_per_token / kv_cache.element_size(),
         "kv_cache.size(2) must be ", bytes_per_token, " bytes for ",
@@ -997,7 +998,7 @@ void concat_and_cache_mla(
     vllm::launch_concat_and_cache_nvfp4_ds_mla(
         kv_c.data_ptr(), k_pe.data_ptr(), kv_cache.data_ptr(),
         slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride,
-        kv_c_stride, k_pe_stride, block_size, num_tokens, stream);
+        kv_c_stride, k_pe_stride, pe_dim, block_size, num_tokens, stream);
 #else
     STD_TORCH_CHECK(false,
                     "the nvfp4 ds_mla kv-cache format requires a CUDA build "

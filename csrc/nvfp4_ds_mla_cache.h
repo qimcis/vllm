@@ -16,15 +16,15 @@ namespace vllm {
 
 // concat_and_cache_mla for the nvfp4_ds_mla layout.
 //   kv_c:       bf16   [num_tokens, 512]
-//   k_pe:       bf16   [num_tokens, 64]
+//   k_pe:       bf16   [num_tokens, pe_dim]; pe_dim 0 zero-fills the RoPE slot
 //   kv_cache:   uint8  [num_blocks, block_size, 352]
 void launch_concat_and_cache_nvfp4_ds_mla(const void* kv_c, const void* k_pe,
                                           void* kv_cache,
                                           const int64_t* slot_mapping,
                                           int block_stride, int entry_stride,
                                           int kv_c_stride, int k_pe_stride,
-                                          int block_size, int num_tokens,
-                                          cudaStream_t stream);
+                                          int pe_dim, int block_size,
+                                          int num_tokens, cudaStream_t stream);
 
 // Gather an nvfp4_ds_mla cache into a bf16 [total_tokens, 576] workspace.
 void launch_cp_gather_and_upconvert_nvfp4_kv_cache(

@@ -474,6 +474,15 @@ class FlashInferBackend(AttentionBackend):
                 and current_platform.is_device_capability_family(100)
                 and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
             )
+            if (
+                use_large_pages
+                and isinstance(kv_cache_spec, AttentionSpec)
+                and kv_cache_spec.num_kv_heads != num_kv_heads
+            ):
+                # These layers are not the target's (e.g. an MHA draft head on an
+                # MLA target), so the model config's Q/KV head ratio does not
+                # describe them. Large pages need GQA; stay on small pages.
+                use_large_pages = False
         if not use_large_pages:
             return [16, 32, 64]
         return [16, 32, 64, 128, 256, 512, 1024]

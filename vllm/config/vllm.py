@@ -2021,6 +2021,7 @@ class VllmConfig:
 
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
+        self._resolve_draft_kv_cache_dtype()
         self._validate_adaptive_verification()
 
         # Re-compute compile ranges after platform-specific config updates
@@ -2997,6 +2998,30 @@ class VllmConfig:
             unsupported.append("batch-sharded sampling")
 
         return unsupported
+
+    def _resolve_draft_kv_cache_dtype(self) -> None:
+        """Keep a non-MLA draft off the target's MLA-only KV cache formats.
+
+        fp8_ds_mla and nvfp4_ds_mla pack MLA latent records and have no K/V
+        layout, so a draft with standard attention (e.g. DSpark or DFlash on
+        an MLA target) cannot store its cache in them. Unless the user chose a
+        draft dtype, store the draft's cache as "auto".
+        """
+        spec_config = self.speculative_config
+        if (
+            spec_config is None
+            or spec_config.kv_cache_dtype is not None
+            or spec_config.draft_model_config is None
+            or self.cache_config.cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla")
+            or spec_config.draft_model_config.use_mla
+        ):
+            return
+        logger.info(
+            "The draft model does not use MLA, so it cannot share the target's "
+            "%s KV cache format; storing the draft KV cache as 'auto'.",
+            self.cache_config.cache_dtype,
+        )
+        spec_config.kv_cache_dtype = "auto"
 
     def _validate_adaptive_verification(self) -> None:
         spec_config = self.speculative_config

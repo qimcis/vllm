@@ -100,7 +100,22 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     if HAS_NULL_BLOCK:  # noqa
         if conv_states_input_coord == null_block_id:
-            # not processing as this is a null block (padding)
+            # Null-block rows are padding (e.g. DP dummy batches, which are
+            # classified as prefills). Zero their output tile: downstream
+            # layers consume it, and `out` is allocated uninitialized.
+            offs_m = tl.arange(0, BLOCK_M)
+            zero_mask = (offs_m[:, None] < segment_len) & (idx_feats[None, :] < dim)
+            zero_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + offs_m[:, None])
+                * stride_o_token
+                + idx_feats[None, :] * stride_o_dim
+            )
+            tl.store(
+                zero_ptrs,
+                tl.zeros((BLOCK_M, BLOCK_N), dtype=o_ptr.dtype.element_ty),
+                mask=zero_mask,
+            )
             if launch_pdl:
                 tl.extra.cuda.gdc_launch_dependents()
             return

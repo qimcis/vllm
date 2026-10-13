@@ -142,8 +142,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
+            # Skip if state index is invalid (NULL_BLOCK_ID=0). Padding rows
+            # still emit zeros so `o` is never left uninitialized.
             if state_idx <= 0:
+                for _ in range(0, T):
+                    tl.store(
+                        p_o, tl.zeros([BV], dtype=p_o.dtype.element_ty), mask=mask_v
+                    )
+                    p_o += HV * V
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:

@@ -1027,6 +1027,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.vllm_config.speculative_config
             else 0
         )
+        self.adaptive_verification = bool(
+            self.vllm_config.speculative_config
+            and self.vllm_config.speculative_config.enable_adaptive_verification
+        )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
 
         next_n = self.num_speculative_tokens + 1
@@ -1630,6 +1634,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             min_decode_len = int(decode_lens_cpu.min().item())
             write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
+            write_max_decode_len = max_decode_len
+            if self.adaptive_verification:
+                # Adaptive verification trims drafts on device, so the CPU
+                # lengths are only an even split of the draft budget. Use the
+                # padded [num_decodes, next_n] write layout, which groups tokens
+                # by the device per-request lengths.
+                write_is_uniform = False
+                write_max_decode_len = next_n
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
             # native kernel. max_decode_len <= 1 always has one.
@@ -1764,7 +1776,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
-                write_max_decode_len=max_decode_len,
+                write_max_decode_len=write_max_decode_len,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

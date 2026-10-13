@@ -16,29 +16,27 @@ def _build_decode_scatter_indices(
     n: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token (request id, intra-request index) for a non-uniform decode
-    batch, with ``n == decode_lens.sum()`` as a host int (avoids a
-    device sync and keeps both repeat_interleaves sync-free).
+    batch of ``n`` token slots.
+
+    Indices come from ``searchsorted`` over the per-request cumulative lengths,
+    so shapes depend only on the host ints and the build is sync-free and
+    CUDA-graph safe. ``decode_lens`` may sum to fewer than ``n`` tokens: a
+    variable-length decode graph is captured for ``n`` slots but replayed with
+    the device lengths of the current batch (e.g. drafts trimmed by adaptive
+    verification). Slots past the last request's tokens get intra index -1.
 
     Shared by every ``_scatter_decode_tokens_by_request`` call in a step:
-    building it per call would repeat the same repeat_interleave/cumsum chain
-    up to 5x per layer on the eager decode break.
+    building it per call would repeat the same search up to 5x per layer on
+    the eager decode break.
     """
     device = decode_lens.device
     dl = decode_lens.to(torch.int64)
-    req_id = torch.repeat_interleave(
-        torch.arange(num_requests, device=device, dtype=torch.int64),
-        dl,
-        output_size=n,
-    )
-    req_starts = torch.cumsum(
-        torch.cat([torch.zeros(1, device=device, dtype=torch.int64), dl[:-1]]),
-        dim=0,
-    )
-    # Broadcast the per-request start offsets to per-token (length n ==
-    # dl.sum()) so each token's intra-request index subtracts its own
-    # request's start.
-    starts = torch.repeat_interleave(req_starts, dl, output_size=n)
-    intra = torch.arange(n, device=device, dtype=torch.int64) - starts
+    cu_lens = torch.cumsum(dl, dim=0)
+    token = torch.arange(n, device=device, dtype=torch.int64)
+    req_id = torch.searchsorted(cu_lens, token, right=True)
+    valid = req_id < num_requests
+    req_id = req_id.clamp_(max=num_requests - 1)
+    intra = torch.where(valid, token - (cu_lens[req_id] - dl[req_id]), -1)
     return req_id, intra
 
 
@@ -56,17 +54,20 @@ def _scatter_decode_tokens_by_request(
     slot/pos tensors) — it scatters with the shared per-step indices from
     ``_build_decode_scatter_indices``. Used only for the non-uniform
     (``requires_padding``) decode batch; uniform batches use a zero-copy
-    reshape.
+    reshape. Token slots without a request position land in one spare row
+    past the grid, so the scatter stays in bounds without a host sync.
     """
     req_id, intra = scatter_indices
+    rows = num_requests * lmax
     out = torch.full(
-        (num_requests, lmax, *tokens.shape[1:]),
+        (rows + 1, *tokens.shape[1:]),
         pad_value,
         dtype=tokens.dtype,
         device=tokens.device,
     )
-    out[req_id, intra] = tokens
-    return out
+    valid = (intra >= 0) & (intra < lmax)
+    out[torch.where(valid, req_id * lmax + intra, rows)] = tokens
+    return out[:rows].view(num_requests, lmax, *tokens.shape[1:])
 
 
 def _decode_topk_seq_lens(

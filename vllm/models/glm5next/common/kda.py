@@ -45,8 +45,13 @@ from vllm.model_executor.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.attention.backend import AttentionBackend, max_decode_query_len
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -160,10 +165,48 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
+class Glm5NextKDAMetadataBuilder(GDNAttentionMetadataBuilder):
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> int | None:
+        # The spec-decode conv and recurrent kernels read per-request offsets
+        # from the device query_start_loc within a fixed k+1 window, so a
+        # decode graph replays any mix of 1..k+1 tokens per request.
+        return max_decode_query_len(vllm_config)
+
+
+class Glm5NextKDAAttentionBackend(GDNAttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "GLM5NEXT_KDA"
+
+    @staticmethod
+    def get_builder_cls() -> type[Glm5NextKDAMetadataBuilder]:
+        return Glm5NextKDAMetadataBuilder
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Spec rows take their offsets from the device query_start_loc; the
+        # mixed branch relies only on CPU totals, which adaptive verification
+        # keeps exact.
+        return True
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
     conv_size: int
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.enable_adaptive_verification
+        ):
+            return Glm5NextKDAAttentionBackend
+        return super().get_attn_backend()
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
